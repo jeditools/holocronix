@@ -1,0 +1,40 @@
+# Claude Code
+.claude/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Python
+*.pyc
+*.pyo
+__pycache__/
+*.egg-info/
+.eggs/
+*.egg
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+.npm/
+
+# Editors
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.sublime-*
+
+# Nix dev environment
+.nix-dev-env.sh
+
+# Misc
+*.log
+.env.local
+.env.*.local

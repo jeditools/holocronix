@@ -1,13 +1,13 @@
 # shellcheck shell=bash
-# Zsh configuration for Claude Code devcontainer
+# Zsh configuration for jedicave
 
 # Add Claude Code to PATH
 export PATH="$HOME/.local/bin:$PATH"
 
-# fnm (Fast Node Manager)
-export FNM_DIR="$HOME/.fnm"
-export PATH="$FNM_DIR:$PATH"
-eval "$(fnm env --use-on-cd)"
+# Oh My Zsh ($ZSH env var is set by the container environment)
+ZSH_THEME="robbyrussell"
+plugins=(git)
+source "$ZSH/oh-my-zsh.sh"
 
 # History settings
 export HISTFILE=/commandhistory/.zsh_history
@@ -30,7 +30,6 @@ setopt COMPLETE_IN_WORD        # Complete from both ends of word
 setopt ALWAYS_TO_END           # Move cursor to end after completion
 
 # Aliases
-alias fd=fdfind
 alias sg=ast-grep
 alias claude-yolo='claude --dangerously-skip-permissions'
 alias ll='ls -lah --color=auto'
@@ -39,18 +38,32 @@ alias l='ls -CF --color=auto'
 alias grep='grep --color=auto'
 
 # fzf configuration - use fd for faster file finding
-export FZF_DEFAULT_COMMAND='fdfind --type f --hidden --follow --exclude .git'
+export FZF_DEFAULT_COMMAND='fd --type f --hidden --follow --exclude .git'
 export FZF_CTRL_T_COMMAND="$FZF_DEFAULT_COMMAND"
-export FZF_ALT_C_COMMAND='fdfind --type d --hidden --follow --exclude .git'
+export FZF_ALT_C_COMMAND='fd --type d --hidden --follow --exclude .git'
 export FZF_DEFAULT_OPTS='--height 40% --layout=reverse --border --info=inline'
 
 # Use fd for ** completion (e.g., vim **)
 _fzf_compgen_path() {
-  fdfind --hidden --follow --exclude .git . "$1"
+  fd --hidden --follow --exclude .git . "$1"
 }
 _fzf_compgen_dir() {
-  fdfind --type d --hidden --follow --exclude .git . "$1"
+  fd --type d --hidden --follow --exclude .git . "$1"
 }
 
 # Source fzf shell integration (built-in since fzf 0.48+)
 eval "$(fzf --zsh)"
+
+# Nix dev environment activation
+# Usage: dev [path]
+#   dev              - activate baked env from current directory
+#   dev /some/path   - activate baked env from specified directory
+dev() {
+  local env_file="${1:-.}/.nix-dev-env.sh"
+  if [[ ! -f "$env_file" ]]; then
+    echo "No baked dev environment found."
+    return 1
+  fi
+  echo "Entering dev environment (Ctrl-D or 'exit' to leave)..."
+  bash --rcfile <(echo "source '$env_file'; export PS1='(nix-dev) \w \$ '")
+}

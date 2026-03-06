@@ -1,250 +1,317 @@
-# Claude Code in a devcontainer
+# Holocronix
 
-A sandboxed development environment for running Claude Code with `bypassPermissions` safely enabled. Built at [Trail of Bits](https://www.trailofbits.com/) for security audit workflows.
+A Nix flake library for building sandboxed containers. Bake project
+toolchains into reproducible OCI images and run AI coding agents safely
+inside isolated environments.
+
+Inspired by [Trail of Bits' claude-code-devcontainer](https://github.com/trailofbits/claude-code-devcontainer).
 
 ## Why Use This?
 
-Running Claude with `bypassPermissions` on your host machine is risky—it can execute any command without confirmation. This devcontainer provides **filesystem isolation** so you get the productivity benefits of unrestricted Claude without risking your host system.
+Running AI coding agents with unrestricted permissions on your host
+machine is risky — they can execute any command without confirmation. A
+jedicave provides **filesystem isolation** so you get the productivity
+benefits of autonomous agents without risking your host system.
+
+Currently ships with [Claude Code](https://claude.ai) via
+[llm-agents.nix](https://github.com/numtide/llm-agents.nix). Support
+for additional agents is planned.
 
 **Designed for:**
 
-- **Security audits**: Review client code without risking your host
+- **Experimentation**: Let agents modify code freely in isolation
 - **Untrusted repositories**: Explore unknown codebases safely
-- **Experimental work**: Let Claude modify code freely in isolation
-- **Multi-repo engagements**: Work on multiple related repositories
+- **Reproducible toolchains**: Bake project deps into the image via Nix devShells
+- **Offline builds**: All tools baked in at build time — no runtime downloads
+
+## Status
+
+This is an early-stage project. Expect rough edges.
+
+- **Tested on**: Fedora (x86_64) with Docker Engine
+- **Not tested on**: macOS, other Linux distros, Docker Desktop, Podman
+- **Requires**: Projects you want to sandbox should have a `flake.nix`
+  that exposes a `devShells` output (or you can use `extraPackages` to
+  add tools manually)
+
+## Naming
+
+| Term | What it is |
+|------|-----------|
+| **Holocronix** | This repo — the Nix flake library |
+| **Jedicave** | A sandbox instance with its own flake.nix and compose.yml |
+| **jedi** | The CLI that manages caves |
 
 ## Prerequisites
 
-- **Docker runtime** (one of):
-  - [Docker Desktop](https://docker.com/products/docker-desktop) - ensure it's running
-  - [OrbStack](https://orbstack.dev/)
-  - [Colima](https://github.com/abiosoft/colima): `brew install colima docker && colima start`
+- **[Nix](https://nixos.org/download/)** (with flakes enabled)
+- **[Docker Engine](https://docs.docker.com/engine/install/)**
 
-- **For terminal workflows** (one-time install):
-
-  ```bash
-  npm install -g @devcontainers/cli
-  git clone https://github.com/trailofbits/claude-code-devcontainer ~/.claude-devcontainer
-  ~/.claude-devcontainer/install.sh self-install
-  ```
-
-<details>
-<summary><strong>Optimizing Colima for Apple Silicon</strong></summary>
-
-Colima's defaults (QEMU + sshfs) are conservative. For better performance:
-
-```bash
-# Stop and delete current VM (removes containers/images)
-colima stop && colima delete
-
-# Start with optimized settings
-colima start \
-  --cpu 4 \
-  --memory 8 \
-  --disk 100 \
-  --vm-type vz \
-  --vz-rosetta \
-  --mount-type virtiofs
-```
-
-Adjust `--cpu` and `--memory` based on your Mac (e.g., 6/16 for Pro, 8/32 for Max).
-
-| Option | Benefit |
-|--------|---------|
-| `--vm-type vz` | Apple Virtualization.framework (faster than QEMU) |
-| `--mount-type virtiofs` | 5-10x faster file I/O than sshfs |
-| `--vz-rosetta` | Run x86 containers via Rosetta |
-
-Verify with `colima status` - should show "macOS Virtualization.Framework" and "virtiofs".
-
-</details>
+Other Docker runtimes (Docker Desktop, Podman, etc.) may work but have
+not been tested.
 
 ## Quick Start
 
-Choose the pattern that fits your workflow:
-
-### Pattern A: Per-Project Container (Isolated)
-
-Each project gets its own container with independent volumes. Best for one-off reviews, untrusted repos, or when you need isolation between projects.
-
-**Terminal:**
+### 1. Install the CLI
 
 ```bash
-git clone <untrusted-repo>
-cd untrusted-repo
-devc .          # Installs template + starts container
-devc shell      # Opens shell in container
+nix profile install github:jeditools/holocronix#jedi
 ```
 
-**VS Code / Cursor:**
-
-1. Install the Dev Containers extension:
-   - VS Code: `ms-vscode-remote.remote-containers`
-   - Cursor: `anysphere.remote-containers`
-
-2. Set up the devcontainer (choose one):
-
-   ```bash
-   # Option A: Use devc (recommended)
-   devc .
-
-   # Option B: Clone manually
-   git clone https://github.com/trailofbits/claude-code-devcontainer .devcontainer/
-   ```
-
-3. Open **your project folder** in VS Code, then:
-   - Press `Cmd+Shift+P` (Mac) or `Ctrl+Shift+P` (Windows/Linux)
-   - Type "Reopen in Container" and select **Dev Containers: Reopen in Container**
-
-### Pattern B: Shared Workspace Container (Grouped)
-
-A parent directory contains the devcontainer config, and you clone multiple repos inside. Shared volumes across all repos. Best for client engagements, related repositories, or ongoing work.
+Or run without installing:
 
 ```bash
-# Create workspace for a client engagement
-mkdir -p ~/sandbox/client-name
-cd ~/sandbox/client-name
-devc .          # Install template + start container
-devc shell      # Opens shell in container
-
-# Inside container:
-git clone <client-repo-1>
-git clone <client-repo-2>
-cd client-repo-1
-claude          # Ready to work
+nix run github:jeditools/holocronix -- <command>
 ```
 
-## CLI Helper Commands
-
-```
-devc .              Install template + start container in current directory
-devc up             Start the devcontainer
-devc rebuild        Rebuild container (preserves persistent volumes)
-devc down           Stop the container
-devc shell          Open zsh shell in container
-devc exec CMD       Execute command inside the container
-devc upgrade        Upgrade Claude Code in the container
-devc mount SRC DST  Add a bind mount (host → container)
-devc template DIR   Copy devcontainer files to directory
-devc self-install   Install devc to ~/.local/bin
-```
-
-## File Sharing
-
-### VS Code / Cursor
-
-Drag files from your host into the VS Code Explorer panel — they are copied into `/workspace/` automatically. No configuration needed.
-
-### Terminal: `devc mount`
-
-To make a host directory available inside the container:
+### 2. Create a cave
 
 ```bash
-devc mount ~/drop /drop           # Read-write
-devc mount ~/secrets /secrets --readonly
+jedi init dagobah
 ```
 
-This adds a bind mount to `devcontainer.json` and recreates the container. Existing mounts are preserved across `devc template` updates.
+This scaffolds `~/.config/jedicaves/dagobah/` with:
+- `flake.nix` — references holocronix + your project inputs
+- `compose.yml` — container runtime config
+- `firewall-defaults.conf` — domain allowlist
 
-**Tip:** A shared "drop folder" is useful for passing files in without mounting your entire home directory.
+### 3. Configure the cave
 
-> **Security note:** Avoid mounting large host directories (e.g., `$HOME`). Every mounted path is writable from inside the container unless `--readonly` is specified, which undermines the filesystem isolation this project provides.
+Edit `~/.config/jedicaves/dagobah/flake.nix` — add your project as an
+input and wire its devShell:
+
+```nix
+{
+  inputs = {
+    holocronix.url = "github:jeditools/holocronix";
+    foo.url = "path:/home/user/code/foo";
+  };
+
+  outputs = { holocronix, ... }@inputs: let
+    system = "x86_64-linux";
+    mkJediCave = holocronix.lib.${system}.mkJediCave;
+  in {
+    packages.${system}.container = mkJediCave {
+      projectShells = [
+        inputs.foo.devShells.${system}.default
+      ];
+    };
+  };
+}
+```
+
+**Note:** Your project needs a `flake.nix` with a `devShells` output for
+this to work. If it doesn't have one, you can still use `extraPackages`
+to add tools manually:
+
+```nix
+packages.${system}.container = mkJediCave {
+  extraPackages = with holocronix.inputs.nixpkgs.legacyPackages.${system}; [
+    go
+    gopls
+  ];
+};
+```
+
+Create `~/.config/jedicaves/dagobah/compose.override.yml` for source mounts:
+
+```yaml
+services:
+  shell:
+    volumes:
+      - /home/user/code/foo:/workspace/foo
+```
+
+### 4. Build
+
+```bash
+jedi build dagobah
+```
+
+This runs `nix build` and loads the image into Docker. The resulting image
+contains all base tools **plus** everything from your project's devShell.
+
+### 5. Use
+
+```bash
+jedi shell dagobah     # Ephemeral — container removed on exit
+jedi up dagobah        # Long-running — stays in background
+jedi enter dagobah     # Enter the running cave
+jedi down dagobah      # Stop
+```
+
+## CLI Reference
+
+| Command | Description | Requires `up`? |
+|---------|-------------|----------------|
+| `jedi init <name>` | Create a new cave | — |
+| `jedi build [name]` | Build cave image | — |
+| `jedi build --update [input]` | Update flake inputs then build | — |
+| `jedi shell [name]` | Ephemeral cave, removed on exit | No |
+| `jedi up [name]` | Start cave in background | — |
+| `jedi enter [name]` | Enter a running cave | Yes |
+| `jedi exec [name] -- cmd` | Run command in running cave | Yes |
+| `jedi down [name]` | Stop cave | — |
+| `jedi list` | List all caves with status | — |
+| `jedi firewall <on\|off\|status> [name]` | Manage network firewall | Yes |
+| `jedi destroy <name>` | Delete a cave | — |
+
+When only one cave exists, the name can be omitted.
+
+## Architecture
+
+```
+~/.config/jedicaves/dagobah/
+├── flake.nix                  ← imports holocronix + project
+├── flake.lock
+├── compose.yml                ← container runtime config
+├── compose.override.yml       ← project source mounts
+└── firewall-defaults.conf     ← domain allowlist
+```
+
+```
+┌────────────────────────────────────────────────────────────┐
+│  Cave flake.nix                                            │
+│  ┌──────────────────────┐  ┌────────────────────────────┐  │
+│  │ input: holocronix    │  │ input: foo (your project)  │  │
+│  │ (this repo)          │  │ path:/home/user/code/foo   │  │
+│  └──────────┬───────────┘  └──────────────┬─────────────┘  │
+│             │                              │                │
+│             ▼                              ▼                │
+│  mkJediCave {                                          │
+│    projectShells = [ foo.devShells.x86_64-linux.default ]; │
+│  }                                                         │
+│             │                                              │
+│             ▼                                              │
+│  OCI image: base tools + foo's toolchain                   │
+└────────────────────────────────────────────────────────────┘
+```
+
+| Layer | What's included | Source |
+|-------|-----------------|--------|
+| **Base** | Claude Code, zsh, git, ripgrep, tmux, Python, Node.js, build tools, firewall | `lib/mkJediCave.nix` |
+| **Project** | Compiler, cross-toolchain, build deps from the project's devShell | Project's `flake.nix` |
+| **Runtime** | Source code (bind-mounted), persistent volumes for config/history | `compose.yml` |
+
+## Multiple Projects
+
+Add more inputs and shells — deps are merged (assumes compatible toolchains):
+
+```nix
+{
+  inputs = {
+    holocronix.url = "github:jeditools/holocronix";
+    foo.url = "path:/home/user/code/foo";
+    bar.url = "github:owner/bar";
+  };
+
+  outputs = { holocronix, ... }@inputs: let
+    system = "x86_64-linux";
+    mkJediCave = holocronix.lib.${system}.mkJediCave;
+  in {
+    packages.${system}.container = mkJediCave {
+      projectShells = [
+        inputs.foo.devShells.${system}.default
+        inputs.bar.devShells.${system}.default
+      ];
+    };
+  };
+}
+```
+
+## `mkJediCave` Options
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `projectShell` | derivation | `null` | Single devShell (convenience) |
+| `projectShells` | list | `[]` | Multiple devShells |
+| `extraPackages` | list | `[]` | Additional Nix packages |
+| `skills` | attrset | Anthropic + ToB skills | Skill repos |
+| `extraEnv` | attrset | `{}` | Extra environment variables |
+| `extraFakeRootCommands` | string | `""` | Extra image setup commands |
+| `name` | string | `"jedicave"` | Image name |
+| `tag` | string | `"latest"` | Image tag |
 
 ## Network Isolation
 
-By default, containers have full outbound network access. For stricter security, use iptables to restrict network access.
-
-### When to Enable Network Isolation
-
-- Reviewing code that may contain malicious dependencies
-- Auditing software with telemetry or phone-home behavior
-- Maximum isolation for highly sensitive reviews
-
-### Example: Claude + GitHub + Package Registries
+By default, caves have full outbound network access. Use the firewall to
+restrict egress to an allowlist of domains:
 
 ```bash
-sudo iptables -A OUTPUT -d api.anthropic.com -j ACCEPT
-sudo iptables -A OUTPUT -d github.com -j ACCEPT
-sudo iptables -A OUTPUT -d raw.githubusercontent.com -j ACCEPT
-sudo iptables -A OUTPUT -d registry.npmjs.org -j ACCEPT
-sudo iptables -A OUTPUT -d pypi.org -j ACCEPT
-sudo iptables -A OUTPUT -d files.pythonhosted.org -j ACCEPT
-sudo iptables -A OUTPUT -o lo -j ACCEPT
-sudo iptables -A OUTPUT -j DROP
+jedi firewall on dagobah
 ```
 
-### Trade-offs
+The default allowlist (`firewall-defaults.conf`) permits only
+`api.anthropic.com`. Edit it to add more domains.
 
-- Blocks package managers unless you allowlist registries
-- May break tools that require network access
-- DNS resolution still works (consider blocking if paranoid)
+Rules are applied as root — the unprivileged container user cannot modify
+or disable them.
+
+```bash
+jedi firewall off dagobah     # Restore full access
+jedi firewall status dagobah  # Show current rules
+```
+
+## Rebuilding After Changes
+
+Nix caches aggressively. When you modify project source:
+
+```bash
+jedi build --update foo dagobah   # Update foo input, rebuild
+```
+
+To update all inputs (including holocronix, nixpkgs):
+
+```bash
+jedi build --update dagobah
+```
+
+To rebuild without updating (uses cached inputs):
+
+```bash
+jedi build dagobah
+```
 
 ## Security Model
 
-This devcontainer provides **filesystem isolation** but not complete sandboxing.
+**Sandboxed:** Filesystem (host files inaccessible except mounts), processes (isolated namespaces), packages (stay in container)
 
-**Sandboxed:** Filesystem (host files inaccessible), processes (isolated from host), package installations (stay in container)
+**Not sandboxed:** Network (full outbound by default), kernel (shared with host)
 
-**Not sandboxed:** Network (full outbound by default—see [Network Isolation](#network-isolation)), git identity (`~/.gitconfig` mounted read-only), Docker socket (not mounted by default)
+The container auto-configures `bypassPermissions` — Claude runs commands
+without confirmation. This is safe because the container itself is the
+sandbox boundary.
 
-The container auto-configures `bypassPermissions` mode—Claude runs commands without confirmation. This would be risky on a host machine, but the container itself is the sandbox.
+For a detailed analysis, see [SECURITY.md](SECURITY.md).
 
 ## Container Details
 
 | Component | Details |
 |-----------|---------|
-| Base | Ubuntu 24.04, Node.js 22, Python 3.13 + uv, zsh |
-| User | `vscode` (passwordless sudo), working dir `/workspace` |
-| Tools | `rg`, `fd`, `tmux`, `fzf`, `delta`, `iptables`, `ipset` |
-| Volumes (survive rebuilds) | Command history (`/commandhistory`), Claude config (`~/.claude`), GitHub CLI auth (`~/.config/gh`) |
-| Host mounts | `~/.gitconfig` (read-only), `.devcontainer/` (read-only) |
-| Auto-configured | [anthropics](https://github.com/anthropics/claude-code-plugins) + [trailofbits](https://github.com/trailofbits/claude-code-plugins) skills, git-delta |
+| Base | Nix (`dockerTools.buildLayeredImage`), Node.js 22, Python 3.15 + uv, zsh |
+| User | Unprivileged (UID 1000, no sudo), working dir `/workspace` |
+| Tools | `rg`, `fd`, `fzf`, `delta`, `ast-grep`, `tmux`, `jq`, `vim`, `iptables`, `ipset` |
+| Volumes | Command history (`/commandhistory`), Claude config (`/env/.claude`) |
+| Skills | [anthropics/skills](https://github.com/anthropics/skills), [trailofbits/skills](https://github.com/trailofbits/skills), [trailofbits/skills-curated](https://github.com/trailofbits/skills-curated) |
 
-Volumes are stored outside the container, so your shell history, Claude settings, and `gh` login persist even after `devc rebuild`. Host `~/.gitconfig` is mounted read-only for git identity.
+All packages and config are baked into the image at build time — no runtime downloads.
 
 ## Troubleshooting
 
-### "devcontainer CLI not found"
-
-```bash
-npm install -g @devcontainers/cli
-```
-
 ### Container won't start
 
-1. Check Docker is running
-2. Try rebuilding: `devc rebuild`
+1. Check Docker is running: `systemctl status docker`
+2. Rebuild: `jedi build dagobah`
 3. Check logs: `docker logs $(docker ps -lq)`
 
-### GitHub CLI auth not persisting
+### Path input not picking up changes
 
-The gh volume may need ownership fix:
-
-```bash
-sudo chown -R $(id -u):$(id -g) ~/.config/gh
-```
-
-### Python/uv not working
-
-Python is managed via uv:
+`path:` flake inputs are locked by `narHash`. Update the specific input:
 
 ```bash
-uv run script.py              # Run a script
-uv add package                # Add project dependency
-uv run --with requests py.py  # Ad-hoc dependency
+jedi build --update foo dagobah
 ```
 
-## Development
+## Acknowledgments
 
-Build the image manually:
-
-```bash
-devcontainer build --workspace-folder .
-```
-
-Test the container:
-
-```bash
-devcontainer up --workspace-folder .
-devcontainer exec --workspace-folder . zsh
-```
+Built on the foundation of [claude-code-devcontainer](https://github.com/trailofbits/claude-code-devcontainer) by [Trail of Bits](https://www.trailofbits.com/). See [ORIGINS.md](ORIGINS.md) for details.
