@@ -2,3 +2,11 @@ __pycache__/
 .ruff_cache/
 *.pyc
 .DS_Store
+
+# devenv
+.devenv*
+devenv.local.nix
+.direnv
+
+# Generated
+.devcontainer.json

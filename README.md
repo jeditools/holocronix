@@ -20,10 +20,11 @@ Running Claude with `bypassPermissions` on your host machine is risky—it can e
   - [OrbStack](https://orbstack.dev/)
   - [Colima](https://github.com/abiosoft/colima): `brew install colima docker && colima start`
 
+- **[devenv](https://devenv.sh/getting-started/)** (Nix-based builds)
+
 - **For terminal workflows** (one-time install):
 
   ```bash
-  npm install -g @devcontainers/cli
   git clone https://github.com/trailofbits/claude-code-devcontainer ~/.claude-devcontainer
   ~/.claude-devcontainer/install.sh self-install
   ```
@@ -67,34 +68,12 @@ Choose the pattern that fits your workflow:
 
 Each project gets its own container with independent volumes. Best for one-off reviews, untrusted repos, or when you need isolation between projects.
 
-**Terminal:**
-
 ```bash
 git clone <untrusted-repo>
 cd untrusted-repo
 devc .          # Installs template + starts container
 devc shell      # Opens shell in container
 ```
-
-**VS Code / Cursor:**
-
-1. Install the Dev Containers extension:
-   - VS Code: `ms-vscode-remote.remote-containers`
-   - Cursor: `anysphere.remote-containers`
-
-2. Set up the devcontainer (choose one):
-
-   ```bash
-   # Option A: Use devc (recommended)
-   devc .
-
-   # Option B: Clone manually
-   git clone https://github.com/trailofbits/claude-code-devcontainer .devcontainer/
-   ```
-
-3. Open **your project folder** in VS Code, then:
-   - Press `Cmd+Shift+P` (Mac) or `Ctrl+Shift+P` (Windows/Linux)
-   - Type "Reopen in Container" and select **Dev Containers: Reopen in Container**
 
 ### Pattern B: Shared Workspace Container (Grouped)
 
@@ -125,17 +104,16 @@ devc shell          Open zsh shell in container
 devc exec CMD       Execute command inside the container
 devc upgrade        Upgrade Claude Code in the container
 devc mount SRC DST  Add a bind mount (host → container)
+devc cp CONT HOST   Copy files/directories from container to host
+devc firewall CMD   Manage container network firewall (on/off/status)
 devc template DIR   Copy devcontainer files to directory
 devc self-install   Install devc to ~/.local/bin
+devc update         Update devc to latest version
 ```
 
 ## File Sharing
 
-### VS Code / Cursor
-
-Drag files from your host into the VS Code Explorer panel — they are copied into `/workspace/` automatically. No configuration needed.
-
-### Terminal: `devc mount`
+### `devc mount`
 
 To make a host directory available inside the container:
 
@@ -144,7 +122,7 @@ devc mount ~/drop /drop           # Read-write
 devc mount ~/secrets /secrets --readonly
 ```
 
-This adds a bind mount to `devcontainer.json` and recreates the container. Existing mounts are preserved across `devc template` updates.
+This adds a bind mount to `docker-compose.yml` and recreates the container.
 
 **Tip:** A shared "drop folder" is useful for passing files in without mounting your entire home directory.
 
@@ -152,7 +130,7 @@ This adds a bind mount to `devcontainer.json` and recreates the container. Exist
 
 ## Network Isolation
 
-By default, containers have full outbound network access. For stricter security, use iptables to restrict network access.
+By default, containers have full outbound network access. Use `devc firewall` to restrict egress to an allowlist of domains.
 
 ### When to Enable Network Isolation
 
@@ -160,18 +138,35 @@ By default, containers have full outbound network access. For stricter security,
 - Auditing software with telemetry or phone-home behavior
 - Maximum isolation for highly sensitive reviews
 
-### Example: Claude + GitHub + Package Registries
+### Usage
 
 ```bash
-sudo iptables -A OUTPUT -d api.anthropic.com -j ACCEPT
-sudo iptables -A OUTPUT -d github.com -j ACCEPT
-sudo iptables -A OUTPUT -d raw.githubusercontent.com -j ACCEPT
-sudo iptables -A OUTPUT -d registry.npmjs.org -j ACCEPT
-sudo iptables -A OUTPUT -d pypi.org -j ACCEPT
-sudo iptables -A OUTPUT -d files.pythonhosted.org -j ACCEPT
-sudo iptables -A OUTPUT -o lo -j ACCEPT
-sudo iptables -A OUTPUT -j DROP
+devc firewall on                # Enable with default allowlist
+devc firewall on ./rules.conf   # Enable with custom allowlist
+devc firewall status            # Show current iptables rules
+devc firewall off               # Disable (restore full access)
 ```
+
+The default allowlist (`config/firewall-defaults.conf`) permits:
+
+- `api.anthropic.com` — Claude API
+- `github.com` / `raw.githubusercontent.com` — Git operations
+- `registry.npmjs.org` — npm packages
+- `pypi.org` / `files.pythonhosted.org` — Python packages
+
+### Custom Rules
+
+Copy the defaults and edit:
+
+```bash
+cp config/firewall-defaults.conf my-rules.conf
+# Edit my-rules.conf — one domain per line, # for comments
+devc firewall on ./my-rules.conf
+```
+
+### How It Works
+
+Firewall rules are applied from the host via `docker compose exec --user root`, not via sudo inside the container. This means the unprivileged container user cannot modify or disable the rules — they are locked down after setup.
 
 ### Trade-offs
 
@@ -185,30 +180,26 @@ This devcontainer provides **filesystem isolation** but not complete sandboxing.
 
 **Sandboxed:** Filesystem (host files inaccessible), processes (isolated from host), package installations (stay in container)
 
-**Not sandboxed:** Network (full outbound by default—see [Network Isolation](#network-isolation)), git identity (`~/.gitconfig` mounted read-only), Docker socket (not mounted by default)
+**Not sandboxed:** Network (full outbound by default—see [Network Isolation](#network-isolation)), Docker socket (not mounted by default)
 
 The container auto-configures `bypassPermissions` mode—Claude runs commands without confirmation. This would be risky on a host machine, but the container itself is the sandbox.
+
+For a detailed analysis of what remains exposed, known gaps, and future hardening directions, see [SECURITY.md](SECURITY.md).
 
 ## Container Details
 
 | Component | Details |
 |-----------|---------|
-| Base | Ubuntu 24.04, Node.js 22, Python 3.13 + uv, zsh |
-| User | `vscode` (passwordless sudo), working dir `/workspace` |
-| Tools | `rg`, `fd`, `tmux`, `fzf`, `delta`, `iptables`, `ipset` |
-| Volumes (survive rebuilds) | Command history (`/commandhistory`), Claude config (`~/.claude`), GitHub CLI auth (`~/.config/gh`) |
-| Host mounts | `~/.gitconfig` (read-only), `.devcontainer/` (read-only) |
-| Auto-configured | [anthropics](https://github.com/anthropics/claude-code-plugins) + [trailofbits](https://github.com/trailofbits/claude-code-plugins) skills, git-delta |
+| Base | Nix (devenv), Node.js 22, Python 3.13 + uv, zsh |
+| User | Unprivileged (no sudo), working dir `/workspace` |
+| Tools | `rg`, `fd`, `fzf`, `delta`, `ast-grep`, `tmux`, `jq`, `vim`, `nix`, `iptables`, `ipset` |
+| Volumes (survive rebuilds) | Command history (`/commandhistory`), Claude config (`/env/.claude`) |
+| Host mounts | None by default |
+| Auto-configured | Claude Code (via [llm-agents.nix](https://github.com/numtide/llm-agents.nix)), [anthropics](https://github.com/anthropics/claude-code-plugins) + [trailofbits](https://github.com/trailofbits/claude-code-plugins) skills, git-delta |
 
-Volumes are stored outside the container, so your shell history, Claude settings, and `gh` login persist even after `devc rebuild`. Host `~/.gitconfig` is mounted read-only for git identity.
+Volumes are stored outside the container, so your shell history and Claude settings persist even after `devc rebuild`.
 
 ## Troubleshooting
-
-### "devcontainer CLI not found"
-
-```bash
-npm install -g @devcontainers/cli
-```
 
 ### Container won't start
 
@@ -216,13 +207,6 @@ npm install -g @devcontainers/cli
 2. Try rebuilding: `devc rebuild`
 3. Check logs: `docker logs $(docker ps -lq)`
 
-### GitHub CLI auth not persisting
-
-The gh volume may need ownership fix:
-
-```bash
-sudo chown -R $(id -u):$(id -g) ~/.config/gh
-```
 
 ### Python/uv not working
 
@@ -239,12 +223,12 @@ uv run --with requests py.py  # Ad-hoc dependency
 Build the image manually:
 
 ```bash
-devcontainer build --workspace-folder .
+devenv container copy --registry "docker-daemon:" shell
 ```
 
 Test the container:
 
 ```bash
-devcontainer up --workspace-folder .
-devcontainer exec --workspace-folder . zsh
+docker compose up -d
+docker compose exec shell bash -c 'export PATH="$DEVENV_PROFILE/bin:$PATH" && exec zsh'
 ```

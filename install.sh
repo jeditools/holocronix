@@ -3,6 +3,7 @@ set -euo pipefail
 
 # Claude Code Devcontainer CLI Helper
 # Provides the `devc` command for managing devcontainers
+# Uses devenv (Nix) for image builds and docker-compose for runtime
 
 # Resolve symlinks to get actual script location
 SOURCE="${BASH_SOURCE[0]}"
@@ -13,6 +14,10 @@ while [[ -L "$SOURCE" ]]; do
 done
 SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
 SCRIPT_NAME="$(basename "$0")"
+
+COMPOSE_SERVICE="shell"
+IMAGE_NAME="claude-code-devcontainer"
+NIX_DEV_ENV_FILE=".nix-dev-env.sh"
 
 # Colors for output
 RED='\033[0;31m'
@@ -26,23 +31,26 @@ print_usage() {
 Usage: devc <command> [options]
 
 Commands:
-    .                   Install devcontainer template to current directory and start
-    up                  Start the devcontainer in current directory
-    rebuild             Rebuild the devcontainer (preserves auth volumes)
-    down                Stop the devcontainer
+    .                   Install template to current directory and start
+    up                  Build image and start the container
+    rebuild             Rebuild image and recreate container
+    bake [path] [-- args]  Bake Nix dev environment for offline use
+    down                Stop the container
     shell               Open a shell in the running container
     self-install        Install 'devc' command to ~/.local/bin
     update              Update devc to the latest version
-    template [dir]      Copy devcontainer template to directory (default: current)
+    template [dir]      Copy devenv template to directory (default: current)
     exec <cmd>          Execute a command in the running container
     upgrade             Upgrade Claude Code to latest version
-    mount <host> <cont> Add a mount to the devcontainer (recreates container)
+    mount <host> <cont> Add a mount to the container (recreates container)
+    mounts              Show current container mounts
     cp <cont> <host>    Copy files/directories from container to host
+    firewall <on|off|status>  Manage container network firewall
     help                Show this help message
 
 Examples:
     devc .                      # Install template and start container
-    devc up                     # Start container in current directory
+    devc up                     # Build and start container
     devc rebuild                # Clean rebuild
     devc shell                  # Open interactive shell
     devc self-install           # Install devc to PATH
@@ -51,6 +59,12 @@ Examples:
     devc upgrade                # Upgrade Claude Code to latest
     devc mount ~/data /data     # Add mount to container
     devc cp /some/file ./out    # Copy a path from container to host
+    devc bake                       # Bake flake dev env in current dir
+    devc bake . -- --impure         # Bake with extra nix args
+    devc firewall on                # Enable default firewall rules
+    devc firewall on ./rules.conf   # Enable with custom rules
+    devc firewall off               # Disable firewall
+    devc firewall status            # Show current rules
 EOF
 }
 
@@ -70,23 +84,15 @@ log_error() {
   echo -e "${RED}[devc]${NC} $1" >&2
 }
 
-check_devcontainer_cli() {
-  if ! command -v devcontainer &>/dev/null; then
-    log_error "devcontainer CLI not found."
-    log_info "Install it with: npm install -g @devcontainers/cli"
-    exit 1
-  fi
-}
-
-check_no_sys_admin() {
-  local workspace="${1:-.}"
-  local dc_json="$workspace/.devcontainer/devcontainer.json"
-  [[ -f "$dc_json" ]] || return 0
-  if jq -e \
-    '.runArgs[]? | select(test("SYS_ADMIN"))' \
-    "$dc_json" >/dev/null 2>&1; then
-    log_error "SYS_ADMIN capability detected in runArgs."
-    log_error "This defeats the read-only .devcontainer mount."
+check_deps() {
+  local missing=()
+  command -v devenv &>/dev/null || missing+=("devenv (https://devenv.sh/getting-started/)")
+  command -v docker &>/dev/null || missing+=("docker")
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    log_error "Missing required tools:"
+    for dep in "${missing[@]}"; do
+      log_error "  - $dep"
+    done
     exit 1
   fi
 }
@@ -95,82 +101,178 @@ get_workspace_folder() {
   echo "${1:-$(pwd)}"
 }
 
-# Extract custom mounts from devcontainer.json to a temp file
-# Returns the temp file path, or empty string if no custom mounts
-#
-# Security: .devcontainer/ is mounted read-only inside the container to prevent
-# a compromised process from injecting malicious mounts or commands into
-# devcontainer.json that execute on the host during rebuild. This protection
-# requires that SYS_ADMIN is never added to runArgs (it would allow remounting
-# read-write).
-extract_mounts_to_file() {
-  local devcontainer_json="$1"
-  local temp_file
-
-  [[ -f "$devcontainer_json" ]] || return 0
-
-  temp_file=$(mktemp)
-
-  # Filter out default mounts by target path (immune to project name changes)
-  local custom_mounts
-  custom_mounts=$(jq -c '
-    .mounts // [] | map(
-      select(
-        (contains("target=/commandhistory,") | not) and
-        (contains("target=/home/vscode/.claude,") | not) and
-        (contains("target=/home/vscode/.config/gh,") | not) and
-        (contains("target=/home/vscode/.gitconfig,") | not) and
-        (contains("target=/workspace/.devcontainer,") | not)
-      )
-    ) | if length > 0 then . else empty end
-  ' "$devcontainer_json" 2>/dev/null) || true
-
-  if [[ -n "$custom_mounts" ]]; then
-    echo "$custom_mounts" >"$temp_file"
-    echo "$temp_file"
-  else
-    rm -f "$temp_file"
-  fi
+build_image() {
+  local workspace="${1:-.}"
+  log_info "Building container image..."
+  (cd "$workspace" && devenv container copy --registry "docker-daemon:" shell)
+  log_success "Image built: $IMAGE_NAME"
 }
 
-# Merge preserved mounts back into devcontainer.json
-merge_mounts_from_file() {
-  local devcontainer_json="$1"
-  local mounts_file="$2"
-
-  [[ -f "$mounts_file" ]] || return 0
-  [[ -s "$mounts_file" ]] || return 0
-
-  local custom_mounts
-  custom_mounts=$(cat "$mounts_file")
-
-  local updated
-  updated=$(jq --argjson custom "$custom_mounts" '
-    .mounts = ((.mounts // []) + $custom | unique)
-  ' "$devcontainer_json")
-
-  echo "$updated" >"$devcontainer_json"
-}
-
-# Add or update a mount in devcontainer.json
-update_devcontainer_mounts() {
-  local devcontainer_json="$1"
+update_compose_mounts() {
+  local compose_file="$1"
   local host_path="$2"
   local container_path="$3"
   local readonly="${4:-false}"
+  local raw_entry="${5:-}"
 
-  local mount_str="source=${host_path},target=${container_path},type=bind"
-  [[ "$readonly" == "true" ]] && mount_str="${mount_str},readonly"
+  local mount_entry
+  if [[ -n "$raw_entry" ]]; then
+    mount_entry="$raw_entry"
+  else
+    mount_entry="$host_path:$container_path"
+    [[ "$readonly" == "true" ]] && mount_entry="${mount_entry}:ro"
+  fi
 
-  local updated
-  updated=$(jq --arg target "$container_path" --arg mount "$mount_str" '
-    .mounts = (
-      ((.mounts // []) | map(select(contains("target=" + $target + ",") or endswith("target=" + $target) | not)))
-      + [$mount]
-    )
-  ' "$devcontainer_json")
+  if command -v yq &>/dev/null; then
+    yq -i ".services.${COMPOSE_SERVICE}.volumes += [\"${mount_entry}\"]" "$compose_file"
+  else
+    log_warn "yq not found; appending mount manually"
+    sed -i "/^    volumes:/a\\      - ${mount_entry}" "$compose_file"
+  fi
+}
 
-  echo "$updated" >"$devcontainer_json"
+extract_custom_volumes() {
+  local compose_file="$1"
+  [[ -f "$compose_file" ]] || return
+
+  # Default volumes that ship with the template
+  local defaults=(
+    'claude-code-bashhistory:'
+    'claude-code-config:'
+    ':/workspace:'
+    '/nix/store:'
+  )
+
+  local volumes_section=false
+  local in_service_volumes=false
+  local custom=()
+
+  while IFS= read -r line; do
+    # Detect the volumes key under the service
+    if [[ "$line" =~ ^[[:space:]]+volumes: ]]; then
+      in_service_volumes=true
+      continue
+    fi
+    if $in_service_volumes; then
+      # Volume entries are list items starting with "- "
+      if [[ "$line" =~ ^[[:space:]]+-[[:space:]](.+) ]]; then
+        local entry="${BASH_REMATCH[1]}"
+        local is_default=false
+        for pat in "${defaults[@]}"; do
+          if [[ "$entry" == *"$pat"* ]]; then
+            is_default=true
+            break
+          fi
+        done
+        $is_default || custom+=("$entry")
+      elif [[ "$line" =~ ^[[:space:]]*$ ]] || [[ "$line" =~ ^[[:space:]]*# ]]; then
+        # Skip blank lines and comments within volumes block
+        continue
+      else
+        # Non-list-item line ends the volumes block
+        in_service_volumes=false
+      fi
+    fi
+  done < "$compose_file"
+
+  printf '%s\n' "${custom[@]}"
+}
+
+merge_custom_volumes() {
+  local compose_file="$1"
+  shift
+  local volumes=("$@")
+
+  [[ ${#volumes[@]} -eq 0 ]] && return
+
+  for entry in "${volumes[@]}"; do
+    update_compose_mounts "$compose_file" "" "" "" "$entry"
+  done
+}
+
+bake_dev_env() {
+  local workspace="$1"
+  shift
+  local extra_args=("$@")
+
+  local output_file="$workspace/$NIX_DEV_ENV_FILE"
+
+  # Determine the nix expression source
+  local nix_args=()
+  if [[ -f "$workspace/flake.nix" ]]; then
+    nix_args+=("$workspace")
+  elif [[ -f "$workspace/shell.nix" ]]; then
+    nix_args+=("-f" "$workspace/shell.nix")
+  else
+    log_error "No flake.nix or shell.nix found in $workspace"
+    return 1
+  fi
+
+  nix_args+=("${extra_args[@]}")
+
+  log_info "Baking dev environment..."
+  if ! nix print-dev-env "${nix_args[@]}" > "$output_file"; then
+    log_error "nix print-dev-env failed"
+    rm -f "$output_file"
+    return 1
+  fi
+
+  local line_count
+  line_count=$(wc -l < "$output_file")
+  log_success "Baked dev environment ($line_count lines) -> $NIX_DEV_ENV_FILE"
+}
+
+check_bake_freshness() {
+  local workspace="$1"
+  local baked="$workspace/$NIX_DEV_ENV_FILE"
+
+  [[ -f "$baked" ]] || return 0
+
+  for ref_file in "$workspace/flake.lock" "$workspace/flake.nix" "$workspace/shell.nix"; do
+    if [[ -f "$ref_file" ]] && [[ "$ref_file" -nt "$baked" ]]; then
+      log_warn "$NIX_DEV_ENV_FILE is older than $(basename "$ref_file")"
+      log_warn "Run 'devc bake' to refresh the dev environment"
+      return 0
+    fi
+  done
+}
+
+ensure_nix_store_mount() {
+  local compose_file="$1"
+
+  if grep -q '/nix/store:/nix/store' "$compose_file" 2>/dev/null; then
+    return 0
+  fi
+
+  log_info "Adding /nix/store read-only mount..."
+  update_compose_mounts "$compose_file" "/nix/store" "/nix/store" "true"
+}
+
+cmd_bake() {
+  local target="${1:-.}"
+  target="$(cd "$target" 2>/dev/null && pwd)" || {
+    log_error "Directory does not exist: ${1:-.}"
+    exit 1
+  }
+  shift 2>/dev/null || true
+
+  # Strip leading '--' separator if present
+  [[ "${1:-}" == "--" ]] && shift
+
+  if ! command -v nix &>/dev/null; then
+    log_error "nix is not installed on the host"
+    exit 1
+  fi
+
+  bake_dev_env "$target" "$@"
+
+  # Ensure /nix/store mount in compose file (check workspace root)
+  local workspace_folder
+  workspace_folder="$(get_workspace_folder)"
+  local compose_file="$workspace_folder/docker-compose.yml"
+  if [[ -f "$compose_file" ]]; then
+    ensure_nix_store_mount "$compose_file"
+  fi
 }
 
 cmd_template() {
@@ -180,65 +282,84 @@ cmd_template() {
     exit 1
   }
 
-  local devcontainer_dir="$target_dir/.devcontainer"
-  local devcontainer_json="$devcontainer_dir/devcontainer.json"
-  local preserved_mounts=""
+  # Preserve custom volumes from existing compose file before overwriting
+  local custom_volumes=()
+  if [[ -f "$target_dir/docker-compose.yml" ]]; then
+    while IFS= read -r vol; do
+      [[ -n "$vol" ]] && custom_volumes+=("$vol")
+    done < <(extract_custom_volumes "$target_dir/docker-compose.yml")
+  fi
 
-  if [[ -d "$devcontainer_dir" ]]; then
-    log_warn "Devcontainer already exists at $devcontainer_dir"
+  if [[ -f "$target_dir/devenv.nix" ]]; then
+    log_warn "devenv.nix already exists at $target_dir"
     read -p "Overwrite? [y/N] " -n 1 -r
     echo
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-      log_info "Aborted."
-      exit 0
-    fi
-
-    # Preserve custom mounts before overwriting
-    preserved_mounts=$(extract_mounts_to_file "$devcontainer_json")
-    if [[ -n "$preserved_mounts" ]]; then
-      log_info "Preserving custom mounts..."
-    fi
+    [[ $REPLY =~ ^[Yy]$ ]] || { log_info "Aborted."; exit 0; }
   fi
 
-  mkdir -p "$devcontainer_dir"
+  cp "$SCRIPT_DIR/devenv.yaml" "$target_dir/"
+  cp "$SCRIPT_DIR/devenv.nix" "$target_dir/"
+  cp "$SCRIPT_DIR/docker-compose.yml" "$target_dir/"
+  cp -r "$SCRIPT_DIR/config" "$target_dir/"
 
-  # Copy template files
-  cp "$SCRIPT_DIR/Dockerfile" "$devcontainer_dir/"
-  cp "$SCRIPT_DIR/devcontainer.json" "$devcontainer_dir/"
-  cp "$SCRIPT_DIR/post_install.py" "$devcontainer_dir/"
-  cp "$SCRIPT_DIR/.zshrc" "$devcontainer_dir/"
-
-  # Restore preserved mounts
-  if [[ -n "$preserved_mounts" ]]; then
-    merge_mounts_from_file "$devcontainer_json" "$preserved_mounts"
-    rm -f "$preserved_mounts"
-    log_info "Custom mounts restored"
+  # Re-add any custom volumes that were in the previous compose file
+  if [[ ${#custom_volumes[@]} -gt 0 ]]; then
+    log_info "Preserving ${#custom_volumes[@]} custom volume(s)..."
+    merge_custom_volumes "$target_dir/docker-compose.yml" "${custom_volumes[@]}"
   fi
 
-  log_success "Template installed to $devcontainer_dir"
+  log_success "Template installed to $target_dir"
+  log_info "Files: devenv.yaml, devenv.nix, docker-compose.yml, config/"
 }
 
 cmd_up() {
   local workspace_folder
   workspace_folder="$(get_workspace_folder "${1:-}")"
 
-  check_devcontainer_cli
-  check_no_sys_admin "$workspace_folder"
+  check_deps
+
   log_info "Starting devcontainer in $workspace_folder..."
 
-  devcontainer up --workspace-folder "$workspace_folder"
+  build_image "$workspace_folder"
+
+  # Auto-bake if workspace has a Nix flake/shell and nix is available
+  if command -v nix &>/dev/null; then
+    if [[ -f "$workspace_folder/flake.nix" ]] || [[ -f "$workspace_folder/shell.nix" ]]; then
+      if [[ ! -f "$workspace_folder/$NIX_DEV_ENV_FILE" ]]; then
+        bake_dev_env "$workspace_folder" || log_warn "Auto-bake failed; use 'devc bake' manually"
+      else
+        check_bake_freshness "$workspace_folder"
+      fi
+      ensure_nix_store_mount "$workspace_folder/docker-compose.yml"
+    fi
+  fi
+
+  (cd "$workspace_folder" && docker compose up -d)
+
   log_success "Devcontainer started"
+  log_info "Run 'devc shell' to open a shell"
 }
 
 cmd_rebuild() {
   local workspace_folder
   workspace_folder="$(get_workspace_folder "${1:-}")"
 
-  check_devcontainer_cli
-  check_no_sys_admin "$workspace_folder"
+  check_deps
+
   log_info "Rebuilding devcontainer in $workspace_folder..."
 
-  devcontainer up --workspace-folder "$workspace_folder" --remove-existing-container
+  build_image "$workspace_folder"
+
+  # Force re-bake on rebuild if nix is available and flake/shell exists
+  if command -v nix &>/dev/null; then
+    if [[ -f "$workspace_folder/flake.nix" ]] || [[ -f "$workspace_folder/shell.nix" ]]; then
+      bake_dev_env "$workspace_folder" || log_warn "Auto-bake failed; use 'devc bake' manually"
+      ensure_nix_store_mount "$workspace_folder/docker-compose.yml"
+    fi
+  fi
+
+  (cd "$workspace_folder" && docker compose up -d --force-recreate)
+
   log_success "Devcontainer rebuilt"
 }
 
@@ -246,49 +367,35 @@ cmd_down() {
   local workspace_folder
   workspace_folder="$(get_workspace_folder "${1:-}")"
 
-  check_devcontainer_cli
   log_info "Stopping devcontainer..."
-
-  # Get container ID and stop it
-  local label="devcontainer.local_folder=$workspace_folder"
-  local container_id
-  container_id=$(docker ps -q --filter "label=$label" 2>/dev/null || true)
-
-  if [[ -n "$container_id" ]]; then
-    docker stop "$container_id"
-    log_success "Devcontainer stopped"
-  else
-    log_warn "No running devcontainer found for $workspace_folder"
-  fi
+  (cd "$workspace_folder" && docker compose down)
+  log_success "Devcontainer stopped"
 }
 
 cmd_shell() {
   local workspace_folder
   workspace_folder="$(get_workspace_folder)"
 
-  check_devcontainer_cli
-  log_info "Opening shell in devcontainer..."
-
-  devcontainer exec --workspace-folder "$workspace_folder" zsh
+  # DEVENV_PROFILE is baked into the image env; use it to set PATH for exec sessions
+  (cd "$workspace_folder" && docker compose exec "$COMPOSE_SERVICE" \
+    bash -c 'export PATH="$DEVENV_PROFILE/bin:$PATH" && exec zsh')
 }
 
 cmd_exec() {
   local workspace_folder
   workspace_folder="$(get_workspace_folder)"
 
-  check_devcontainer_cli
-  devcontainer exec --workspace-folder "$workspace_folder" "$@"
+  (cd "$workspace_folder" && docker compose exec "$COMPOSE_SERVICE" \
+    bash -c "export PATH=\"\$DEVENV_PROFILE/bin:\$PATH\" && $(printf '%q ' "$@")")
 }
 
 cmd_upgrade() {
   local workspace_folder
   workspace_folder="$(get_workspace_folder)"
 
-  check_devcontainer_cli
   log_info "Upgrading Claude Code..."
-
-  devcontainer exec --workspace-folder "$workspace_folder" claude update
-
+  (cd "$workspace_folder" && docker compose exec "$COMPOSE_SERVICE" \
+    bash -c 'export PATH="$DEVENV_PROFILE/bin:$PATH" && claude update')
   log_success "Claude Code upgraded"
 }
 
@@ -304,7 +411,6 @@ cmd_mount() {
 
   [[ "${3:-}" == "--readonly" ]] && readonly="true"
 
-  # Expand and validate host path
   host_path="$(cd "$host_path" 2>/dev/null && pwd)" || {
     log_error "Host path does not exist: $1"
     exit 1
@@ -312,22 +418,37 @@ cmd_mount() {
 
   local workspace_folder
   workspace_folder="$(get_workspace_folder)"
-  local devcontainer_json="$workspace_folder/.devcontainer/devcontainer.json"
+  local compose_file="$workspace_folder/docker-compose.yml"
 
-  if [[ ! -f "$devcontainer_json" ]]; then
-    log_error "No devcontainer.json found. Run 'devc template' first."
+  if [[ ! -f "$compose_file" ]]; then
+    log_error "No docker-compose.yml found. Run 'devc template' first."
     exit 1
   fi
 
-  check_devcontainer_cli
+  check_deps
 
   log_info "Adding mount: $host_path → $container_path"
-  update_devcontainer_mounts "$devcontainer_json" "$host_path" "$container_path" "$readonly"
+  update_compose_mounts "$compose_file" "$host_path" "$container_path" "$readonly"
 
   log_info "Recreating container with new mount..."
-  devcontainer up --workspace-folder "$workspace_folder" --remove-existing-container
+  (cd "$workspace_folder" && docker compose up -d --force-recreate)
 
   log_success "Mount added: $host_path → $container_path"
+}
+
+cmd_mounts() {
+  local workspace_folder
+  workspace_folder="$(get_workspace_folder)"
+
+  local container
+  container="$(cd "$workspace_folder" && docker compose ps -q "$COMPOSE_SERVICE" 2>/dev/null)"
+
+  if [[ -z "$container" ]]; then
+    log_error "Container is not running"
+    exit 1
+  fi
+
+  docker inspect "$container" --format '{{range .Mounts}}{{.Type}}	{{.Source}} -> {{.Destination}}	{{if .RW}}rw{{else}}ro{{end}}{{println}}{{end}}'
 }
 
 cmd_cp() {
@@ -342,19 +463,61 @@ cmd_cp() {
   local workspace_folder
   workspace_folder="$(get_workspace_folder)"
 
-  # Find the running container
-  local label="devcontainer.local_folder=$workspace_folder"
-  local container_id
-  container_id=$(docker ps -q --filter "label=$label" 2>/dev/null || true)
-
-  if [[ -z "$container_id" ]]; then
-    log_error "No running devcontainer found for $workspace_folder"
-    exit 1
-  fi
-
   log_info "Copying $container_path → $host_path"
-  docker cp "$container_id:$container_path" "$host_path"
+  (cd "$workspace_folder" && docker compose cp "$COMPOSE_SERVICE:$container_path" "$host_path")
   log_success "Copied $container_path → $host_path"
+}
+
+cmd_firewall() {
+  local action="${1:-}"
+  local workspace_folder
+  workspace_folder="$(get_workspace_folder)"
+
+  case "$action" in
+  on)
+    local config="${2:-$SCRIPT_DIR/config/firewall-defaults.conf}"
+    if [[ ! -f "$config" ]]; then
+      log_error "Config file not found: $config"
+      exit 1
+    fi
+
+    log_info "Applying firewall rules from $config..."
+
+    # Build iptables commands from config
+    local cmds="iptables -F OUTPUT"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%%#*}"        # strip comments
+      line="${line// /}"        # strip whitespace
+      [[ -z "$line" ]] && continue
+      cmds="$cmds && iptables -A OUTPUT -d $line -j ACCEPT"
+    done < "$config"
+    cmds="$cmds && iptables -A OUTPUT -o lo -j ACCEPT"
+    cmds="$cmds && iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT"
+    cmds="$cmds && iptables -A OUTPUT -j DROP"
+
+    (cd "$workspace_folder" && docker compose exec --user root "$COMPOSE_SERVICE" \
+      bash -c "export PATH=\"\$DEVENV_PROFILE/bin:\$PATH\" && $cmds")
+
+    log_success "Firewall enabled ($(grep -cv '^\s*#\|^\s*$' "$config") domains allowlisted)"
+    ;;
+
+  off)
+    log_info "Disabling firewall..."
+    (cd "$workspace_folder" && docker compose exec --user root "$COMPOSE_SERVICE" \
+      bash -c 'export PATH="$DEVENV_PROFILE/bin:$PATH" && iptables -F && iptables -X && iptables -P OUTPUT ACCEPT')
+    log_success "Firewall disabled (full outbound access restored)"
+    ;;
+
+  status)
+    (cd "$workspace_folder" && docker compose exec --user root "$COMPOSE_SERVICE" \
+      bash -c 'export PATH="$DEVENV_PROFILE/bin:$PATH" && iptables -L -n -v')
+    ;;
+
+  *)
+    log_error "Usage: devc firewall <on|off|status> [config_file]"
+    exit 1
+    ;;
+  esac
 }
 
 cmd_self_install() {
@@ -362,13 +525,10 @@ cmd_self_install() {
   local install_path="$install_dir/devc"
 
   mkdir -p "$install_dir"
-
-  # Create a symlink to the original script
   ln -sf "$SCRIPT_DIR/$SCRIPT_NAME" "$install_path"
 
   log_success "Installed 'devc' to $install_path"
 
-  # Check if in PATH
   if [[ ":$PATH:" != *":$install_dir:"* ]]; then
     log_warn "$install_dir is not in your PATH"
     log_info "Add this to your shell profile:"
@@ -403,7 +563,6 @@ cmd_update() {
 }
 
 cmd_dot() {
-  # Install template and start container in one command
   cmd_template "."
   cmd_up "."
 }
@@ -441,11 +600,20 @@ main() {
   upgrade)
     cmd_upgrade
     ;;
+  bake)
+    cmd_bake "$@"
+    ;;
+  mounts)
+    cmd_mounts
+    ;;
   mount)
     cmd_mount "$@"
     ;;
   cp)
     cmd_cp "$@"
+    ;;
+  firewall)
+    cmd_firewall "$@"
     ;;
   self-install)
     cmd_self_install

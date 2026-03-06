@@ -1,7 +1,5 @@
 {
   "permissions": {
-    "deny": [
-      "Read(.devcontainer/**)"
-    ]
+    "deny": []
   }
 }

@@ -1,0 +1,27 @@
+services:
+  shell:
+    image: claude-code-devcontainer:latest
+    init: true
+    stdin_open: true
+    tty: true
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    working_dir: /workspace
+    environment:
+      - TZ=${TZ:-UTC}
+    volumes:
+      # Persistent named volumes (survive rebuilds)
+      - claude-code-bashhistory:/commandhistory
+      - claude-code-config:/env/.claude
+      # - claude-code-gh:/env/.config/gh  # Disabled: gh CLI removed to prevent exfiltration
+      # Host git config (disabled: leaks identity to container)
+      # - ${HOME}/.gitconfig:/env/.gitconfig:ro
+      # Host Nix store (added automatically by 'devc bake')
+      # - /nix/store:/nix/store:ro
+      # Workspace
+      - .:/workspace:cached
+
+volumes:
+  claude-code-bashhistory:
+  claude-code-config:

@@ -1,0 +1,19 @@
+inputs:
+  mk-shell-bin:
+    url: github:rrbutani/nix-mk-shell-bin
+  nix2container:
+    url: github:nlewo/nix2container
+    inputs:
+      nixpkgs:
+        follows: nixpkgs
+  llm-agents:
+    url: github:numtide/llm-agents.nix
+  skills-anthropic:
+    url: github:anthropics/skills
+    flake: false
+  skills-tob:
+    url: github:trailofbits/skills
+    flake: false
+  skills-tob-curated:
+    url: github:trailofbits/skills-curated
+    flake: false
