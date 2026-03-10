@@ -10,3 +10,6 @@ devenv.local.nix
 
 # Generated
 .devcontainer.json
+
+# User-specific overrides
+docker-compose.override.yml

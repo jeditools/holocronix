@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Claude Code Devcontainer CLI Helper
 # Provides the `devc` command for managing devcontainers
-# Uses devenv (Nix) for image builds and docker-compose for runtime
+# Uses Nix (dockerTools) for image builds and docker-compose for runtime
 
 # Resolve symlinks to get actual script location
 SOURCE="${BASH_SOURCE[0]}"
@@ -16,7 +16,7 @@ SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
 SCRIPT_NAME="$(basename "$0")"
 
 COMPOSE_SERVICE="shell"
-IMAGE_NAME="claude-code-devcontainer"
+IMAGE_NAME="claude-sandbox"
 NIX_DEV_ENV_FILE=".nix-dev-env.sh"
 
 # Colors for output
@@ -86,7 +86,7 @@ log_error() {
 
 check_deps() {
   local missing=()
-  command -v devenv &>/dev/null || missing+=("devenv (https://devenv.sh/getting-started/)")
+  command -v nix &>/dev/null || missing+=("nix (https://nixos.org/download/)")
   command -v docker &>/dev/null || missing+=("docker")
   if [[ ${#missing[@]} -gt 0 ]]; then
     log_error "Missing required tools:"
@@ -102,9 +102,9 @@ get_workspace_folder() {
 }
 
 build_image() {
-  local workspace="${1:-.}"
   log_info "Building container image..."
-  (cd "$workspace" && devenv container copy --registry "docker-daemon:" shell)
+  nix build "$SCRIPT_DIR#container" -L
+  docker load < "$SCRIPT_DIR/result"
   log_success "Image built: $IMAGE_NAME"
 }
 
@@ -290,15 +290,13 @@ cmd_template() {
     done < <(extract_custom_volumes "$target_dir/docker-compose.yml")
   fi
 
-  if [[ -f "$target_dir/devenv.nix" ]]; then
-    log_warn "devenv.nix already exists at $target_dir"
+  if [[ -f "$target_dir/docker-compose.yml" ]]; then
+    log_warn "docker-compose.yml already exists at $target_dir"
     read -p "Overwrite? [y/N] " -n 1 -r
     echo
     [[ $REPLY =~ ^[Yy]$ ]] || { log_info "Aborted."; exit 0; }
   fi
 
-  cp "$SCRIPT_DIR/devenv.yaml" "$target_dir/"
-  cp "$SCRIPT_DIR/devenv.nix" "$target_dir/"
   cp "$SCRIPT_DIR/docker-compose.yml" "$target_dir/"
   cp -r "$SCRIPT_DIR/config" "$target_dir/"
 
@@ -309,7 +307,7 @@ cmd_template() {
   fi
 
   log_success "Template installed to $target_dir"
-  log_info "Files: devenv.yaml, devenv.nix, docker-compose.yml, config/"
+  log_info "Files: docker-compose.yml, config/"
 }
 
 cmd_up() {
@@ -320,18 +318,16 @@ cmd_up() {
 
   log_info "Starting devcontainer in $workspace_folder..."
 
-  build_image "$workspace_folder"
+  build_image
 
   # Auto-bake if workspace has a Nix flake/shell and nix is available
-  if command -v nix &>/dev/null; then
-    if [[ -f "$workspace_folder/flake.nix" ]] || [[ -f "$workspace_folder/shell.nix" ]]; then
-      if [[ ! -f "$workspace_folder/$NIX_DEV_ENV_FILE" ]]; then
-        bake_dev_env "$workspace_folder" || log_warn "Auto-bake failed; use 'devc bake' manually"
-      else
-        check_bake_freshness "$workspace_folder"
-      fi
-      ensure_nix_store_mount "$workspace_folder/docker-compose.yml"
+  if [[ -f "$workspace_folder/flake.nix" ]] || [[ -f "$workspace_folder/shell.nix" ]]; then
+    if [[ ! -f "$workspace_folder/$NIX_DEV_ENV_FILE" ]]; then
+      bake_dev_env "$workspace_folder" || log_warn "Auto-bake failed; use 'devc bake' manually"
+    else
+      check_bake_freshness "$workspace_folder"
     fi
+    ensure_nix_store_mount "$workspace_folder/docker-compose.yml"
   fi
 
   (cd "$workspace_folder" && docker compose up -d)
@@ -348,14 +344,12 @@ cmd_rebuild() {
 
   log_info "Rebuilding devcontainer in $workspace_folder..."
 
-  build_image "$workspace_folder"
+  build_image
 
-  # Force re-bake on rebuild if nix is available and flake/shell exists
-  if command -v nix &>/dev/null; then
-    if [[ -f "$workspace_folder/flake.nix" ]] || [[ -f "$workspace_folder/shell.nix" ]]; then
-      bake_dev_env "$workspace_folder" || log_warn "Auto-bake failed; use 'devc bake' manually"
-      ensure_nix_store_mount "$workspace_folder/docker-compose.yml"
-    fi
+  # Force re-bake on rebuild if workspace has a Nix flake/shell
+  if [[ -f "$workspace_folder/flake.nix" ]] || [[ -f "$workspace_folder/shell.nix" ]]; then
+    bake_dev_env "$workspace_folder" || log_warn "Auto-bake failed; use 'devc bake' manually"
+    ensure_nix_store_mount "$workspace_folder/docker-compose.yml"
   fi
 
   (cd "$workspace_folder" && docker compose up -d --force-recreate)
@@ -376,17 +370,14 @@ cmd_shell() {
   local workspace_folder
   workspace_folder="$(get_workspace_folder)"
 
-  # DEVENV_PROFILE is baked into the image env; use it to set PATH for exec sessions
-  (cd "$workspace_folder" && docker compose exec "$COMPOSE_SERVICE" \
-    bash -c 'export PATH="$DEVENV_PROFILE/bin:$PATH" && exec zsh')
+  (cd "$workspace_folder" && docker compose exec "$COMPOSE_SERVICE" zsh)
 }
 
 cmd_exec() {
   local workspace_folder
   workspace_folder="$(get_workspace_folder)"
 
-  (cd "$workspace_folder" && docker compose exec "$COMPOSE_SERVICE" \
-    bash -c "export PATH=\"\$DEVENV_PROFILE/bin:\$PATH\" && $(printf '%q ' "$@")")
+  (cd "$workspace_folder" && docker compose exec "$COMPOSE_SERVICE" "$@")
 }
 
 cmd_upgrade() {
@@ -394,8 +385,7 @@ cmd_upgrade() {
   workspace_folder="$(get_workspace_folder)"
 
   log_info "Upgrading Claude Code..."
-  (cd "$workspace_folder" && docker compose exec "$COMPOSE_SERVICE" \
-    bash -c 'export PATH="$DEVENV_PROFILE/bin:$PATH" && claude update')
+  (cd "$workspace_folder" && docker compose exec "$COMPOSE_SERVICE" claude update)
   log_success "Claude Code upgraded"
 }
 
@@ -496,7 +486,7 @@ cmd_firewall() {
     cmds="$cmds && iptables -A OUTPUT -j DROP"
 
     (cd "$workspace_folder" && docker compose exec --user root "$COMPOSE_SERVICE" \
-      bash -c "export PATH=\"\$DEVENV_PROFILE/bin:\$PATH\" && $cmds")
+      bash -c "$cmds")
 
     log_success "Firewall enabled ($(grep -cv '^\s*#\|^\s*$' "$config") domains allowlisted)"
     ;;
@@ -504,13 +494,13 @@ cmd_firewall() {
   off)
     log_info "Disabling firewall..."
     (cd "$workspace_folder" && docker compose exec --user root "$COMPOSE_SERVICE" \
-      bash -c 'export PATH="$DEVENV_PROFILE/bin:$PATH" && iptables -F && iptables -X && iptables -P OUTPUT ACCEPT')
+      bash -c 'iptables -F && iptables -X && iptables -P OUTPUT ACCEPT')
     log_success "Firewall disabled (full outbound access restored)"
     ;;
 
   status)
     (cd "$workspace_folder" && docker compose exec --user root "$COMPOSE_SERVICE" \
-      bash -c 'export PATH="$DEVENV_PROFILE/bin:$PATH" && iptables -L -n -v')
+      iptables -L -n -v)
     ;;
 
   *)

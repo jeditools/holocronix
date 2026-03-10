@@ -1,6 +1,6 @@
 services:
   shell:
-    image: claude-code-devcontainer:latest
+    image: claude-sandbox:latest
     init: true
     stdin_open: true
     tty: true
@@ -21,6 +21,7 @@ services:
       # - /nix/store:/nix/store:ro
       # Workspace
       - .:/workspace:cached
+      # Add project source mounts in docker-compose.override.yml
 
 volumes:
   claude-code-bashhistory:

@@ -90,9 +90,9 @@ The container is granted `NET_ADMIN` and `NET_RAW` capabilities to support iptab
 
 Persistent volumes (`claude-code-config`, `claude-code-bashhistory`) survive container rebuilds. If a volume is compromised (e.g., malicious Claude settings injected into the config volume), the compromise persists across container restarts. There is currently no integrity verification for volume contents.
 
-### Setup-time network trust
+### Setup-time integrity
 
-The `post-create` script fetches software from the internet at first run: Claude Code from `claude.ai`, Oh My Zsh from GitHub. These fetches happen before any firewall rules are applied. A network-level attacker (or compromised CDN) could serve malicious payloads during this window.
+All software (Claude Code, Oh My Zsh, skills) is baked into the image at build time via Nix from pinned inputs. No runtime downloads occur. The first-boot entrypoint only copies small config files (Claude settings, known marketplaces JSON) from the Nix store into Docker volumes. Build-time integrity depends on the Nix binary cache and flake lock file.
 
 ## Threat model
 
@@ -102,7 +102,7 @@ The `post-create` script fetches software from the internet at first run: Claude
 |-----------|-------------|-----------|
 | Host machine | Trusted | User's workstation; runs Docker, controls container lifecycle |
 | Docker daemon | Trusted | Manages containers; has root-equivalent access to the host |
-| Container image (Nix) | Trusted | Built from pinned Nix derivations on the host before launch |
+| Container image (Nix) | Trusted | Built from pinned Nix flake inputs on the host before launch |
 | Claude Code | Trusted but manipulable | Installed by the user, but runs `bypassPermissions` — will execute whatever code it is asked to, including malicious payloads delivered via prompt injection or dependency confusion |
 | Code under review | Untrusted | The entire reason the container exists; may contain malicious build scripts, backdoored dependencies, or adversarial prompts |
 | Network | Untrusted | Outbound by default; inbound blocked by Docker networking |

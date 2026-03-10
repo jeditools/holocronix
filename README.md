@@ -20,7 +20,7 @@ Running Claude with `bypassPermissions` on your host machine is risky—it can e
   - [OrbStack](https://orbstack.dev/)
   - [Colima](https://github.com/abiosoft/colima): `brew install colima docker && colima start`
 
-- **[devenv](https://devenv.sh/getting-started/)** (Nix-based builds)
+- **[Nix](https://nixos.org/download/)** (with flakes enabled)
 
 - **For terminal workflows** (one-time install):
 
@@ -150,9 +150,8 @@ devc firewall off               # Disable (restore full access)
 The default allowlist (`config/firewall-defaults.conf`) permits:
 
 - `api.anthropic.com` — Claude API
-- `github.com` / `raw.githubusercontent.com` — Git operations
-- `registry.npmjs.org` — npm packages
-- `pypi.org` / `files.pythonhosted.org` — Python packages
+
+Additional domains (GitHub, npm, PyPI) are available as commented-out entries in the config file.
 
 ### Custom Rules
 
@@ -190,14 +189,14 @@ For a detailed analysis of what remains exposed, known gaps, and future hardenin
 
 | Component | Details |
 |-----------|---------|
-| Base | Nix (devenv), Node.js 22, Python 3.13 + uv, zsh |
-| User | Unprivileged (no sudo), working dir `/workspace` |
-| Tools | `rg`, `fd`, `fzf`, `delta`, `ast-grep`, `tmux`, `jq`, `vim`, `nix`, `iptables`, `ipset` |
+| Base | Nix (`dockerTools.buildLayeredImage`), Node.js 22, Python 3.13 + uv, zsh |
+| User | Unprivileged (UID 1000, no sudo), working dir `/workspace` |
+| Tools | `rg`, `fd`, `fzf`, `delta`, `ast-grep`, `tmux`, `jq`, `vim`, `iptables`, `ipset` |
 | Volumes (survive rebuilds) | Command history (`/commandhistory`), Claude config (`/env/.claude`) |
 | Host mounts | None by default |
-| Auto-configured | Claude Code (via [llm-agents.nix](https://github.com/numtide/llm-agents.nix)), [anthropics](https://github.com/anthropics/claude-code-plugins) + [trailofbits](https://github.com/trailofbits/claude-code-plugins) skills, git-delta |
+| Auto-configured | Claude Code (via [llm-agents.nix](https://github.com/numtide/llm-agents.nix)), [anthropics](https://github.com/anthropics/skills) + [trailofbits](https://github.com/trailofbits/skills) skills, git-delta |
 
-Volumes are stored outside the container, so your shell history and Claude settings persist even after `devc rebuild`.
+All packages and config are baked into the image at build time via Nix — no runtime downloads. Skills are stored in the Nix store and referenced by path. Volumes persist shell history and Claude settings across rebuilds.
 
 ## Troubleshooting
 
@@ -223,12 +222,13 @@ uv run --with requests py.py  # Ad-hoc dependency
 Build the image manually:
 
 ```bash
-devenv container copy --registry "docker-daemon:" shell
+nix build .#container -L
+docker load < result
 ```
 
 Test the container:
 
 ```bash
 docker compose up -d
-docker compose exec shell bash -c 'export PATH="$DEVENV_PROFILE/bin:$PATH" && exec zsh'
+docker compose exec shell zsh
 ```
