@@ -1,6 +1,6 @@
 services:
   shell:
-    image: jedibox:latest
+    image: jedicave:latest
     init: true
     stdin_open: true
     tty: true

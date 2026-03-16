@@ -20,7 +20,7 @@
   skills ? defaultSkills,
 
   # Image name and tag
-  name ? "jedibox",
+  name ? "jedicave",
   tag ? "latest",
 
   # Extra environment variables (attrset of "KEY" = "value")

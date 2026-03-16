@@ -60,6 +60,26 @@
         };
         default = self.packages.${system}.container;
         inherit claude-code;
+
+        jedi = pkgs.stdenvNoCC.mkDerivation {
+          pname = "jedi";
+          version = "0.1.0";
+          src = ./cli;
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+          installPhase = ''
+            mkdir -p $out/bin
+            install -m 755 $src/jedi.py $out/bin/jedi
+            wrapProgram $out/bin/jedi \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.python3 ]}
+          '';
+        };
       };
+
+      # ── Apps ───────────────────────────────────────────────────────
+      apps.${system}.jedi = {
+        type = "app";
+        program = "${self.packages.${system}.jedi}/bin/jedi";
+      };
+      apps.${system}.default = self.apps.${system}.jedi;
     };
 }

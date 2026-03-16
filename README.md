@@ -219,7 +219,7 @@ This uses the `project` input slot declared in the base flake.
 | `skills` | attrset | Anthropic + ToB skills | Skill repos |
 | `extraEnv` | attrset | `{}` | Extra environment variables |
 | `extraFakeRootCommands` | string | `""` | Extra image setup commands |
-| `name` | string | `"claude-sandbox"` | Image name |
+| `name` | string | `"jedicave"` | Image name |
 | `tag` | string | `"latest"` | Image tag |
 
 ## Network Isolation
