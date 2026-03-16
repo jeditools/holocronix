@@ -1,12 +1,12 @@
-__pycache__/
-.ruff_cache/
-*.pyc
 .DS_Store
 
-# devenv
+# Nix
+result
+.direnv
+
+# Legacy devenv
 .devenv*
 devenv.local.nix
-.direnv
 
 # Generated
 .devcontainer.json

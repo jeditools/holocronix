@@ -1,6 +1,6 @@
 services:
   shell:
-    image: claude-sandbox:latest
+    image: jedibox:latest
     init: true
     stdin_open: true
     tty: true
@@ -17,11 +17,11 @@ services:
       # - claude-code-gh:/env/.config/gh  # Disabled: gh CLI removed to prevent exfiltration
       # Host git config (disabled: leaks identity to container)
       # - ${HOME}/.gitconfig:/env/.gitconfig:ro
-      # Host Nix store (added automatically by 'devc bake')
-      # - /nix/store:/nix/store:ro
-      # Workspace
-      - .:/workspace:cached
-      # Add project source mounts in docker-compose.override.yml
+      # Project source mounts go in docker-compose.override.yml:
+      #   services:
+      #     shell:
+      #       volumes:
+      #         - /home/user/code/my-project:/workspace/my-project
 
 volumes:
   claude-code-bashhistory:

@@ -11,7 +11,7 @@ Running Claude with `bypassPermissions` on your host machine is risky—it can e
 - **Security audits**: Review client code without risking your host
 - **Untrusted repositories**: Explore unknown codebases safely
 - **Experimental work**: Let Claude modify code freely in isolation
-- **Multi-repo engagements**: Work on multiple related repositories
+- **Offline builds**: Bake project toolchains into the image for network-free builds
 
 ## Prerequisites
 
@@ -22,23 +22,14 @@ Running Claude with `bypassPermissions` on your host machine is risky—it can e
 
 - **[Nix](https://nixos.org/download/)** (with flakes enabled)
 
-- **For terminal workflows** (one-time install):
-
-  ```bash
-  git clone https://github.com/trailofbits/claude-code-devcontainer ~/.claude-devcontainer
-  ~/.claude-devcontainer/install.sh self-install
-  ```
-
 <details>
 <summary><strong>Optimizing Colima for Apple Silicon</strong></summary>
 
 Colima's defaults (QEMU + sshfs) are conservative. For better performance:
 
 ```bash
-# Stop and delete current VM (removes containers/images)
 colima stop && colima delete
 
-# Start with optimized settings
 colima start \
   --cpu 4 \
   --memory 8 \
@@ -48,7 +39,7 @@ colima start \
   --mount-type virtiofs
 ```
 
-Adjust `--cpu` and `--memory` based on your Mac (e.g., 6/16 for Pro, 8/32 for Max).
+Adjust `--cpu` and `--memory` based on your Mac.
 
 | Option | Benefit |
 |--------|---------|
@@ -56,122 +47,202 @@ Adjust `--cpu` and `--memory` based on your Mac (e.g., 6/16 for Pro, 8/32 for Ma
 | `--mount-type virtiofs` | 5-10x faster file I/O than sshfs |
 | `--vz-rosetta` | Run x86 containers via Rosetta |
 
-Verify with `colima status` - should show "macOS Virtualization.Framework" and "virtiofs".
-
 </details>
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  ~/.config/jedi/flake.nix  (your local config, not tracked) │
+│  ┌───────────────────────┐  ┌────────────────────────────┐  │
+│  │ input: devcontainer   │  │ input: foo (your project)  │  │
+│  │ (this repo)           │  │ path:/home/user/code/foo   │  │
+│  └───────────┬───────────┘  └──────────────┬─────────────┘  │
+│              │                              │                │
+│              ▼                              ▼                │
+│  mkDevContainer {                                           │
+│    projectShells = [ foo.devShells.x86_64-linux.default ];  │
+│  }                                                          │
+│              │                                               │
+│              ▼                                               │
+│  OCI image: base tools + foo's toolchain                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+| Layer | What's included | Source |
+|-------|-----------------|--------|
+| **Base** | Claude Code, zsh, git, ripgrep, tmux, Python, Node.js, build tools, firewall tools | `lib/mkDevContainer.nix` |
+| **Project** | Compiler, cross-toolchain, build deps from the project's devShell | Project's `flake.nix` |
+| **Runtime** | Source code (bind-mounted), persistent volumes for config/history | `docker-compose.yml` |
 
 ## Quick Start
 
-Choose the pattern that fits your workflow:
-
-### Pattern A: Per-Project Container (Isolated)
-
-Each project gets its own container with independent volumes. Best for one-off reviews, untrusted repos, or when you need isolation between projects.
+### 1. Build the base image (no project)
 
 ```bash
-git clone <untrusted-repo>
-cd untrusted-repo
-devc .          # Installs template + starts container
-devc shell      # Opens shell in container
+cd /path/to/claude-code-devcontainer
+nix build .#container -L
+docker load < result
 ```
 
-### Pattern B: Shared Workspace Container (Grouped)
-
-A parent directory contains the devcontainer config, and you clone multiple repos inside. Shared volumes across all repos. Best for client engagements, related repositories, or ongoing work.
+### 2. Start the container
 
 ```bash
-# Create workspace for a client engagement
-mkdir -p ~/sandbox/client-name
-cd ~/sandbox/client-name
-devc .          # Install template + start container
-devc shell      # Opens shell in container
-
-# Inside container:
-git clone <client-repo-1>
-git clone <client-repo-2>
-cd client-repo-1
-claude          # Ready to work
+docker compose up -d
+docker compose exec shell zsh
 ```
 
-## CLI Helper Commands
+This gives you a sandbox with all the base tools. Project source can be
+bind-mounted via `docker-compose.override.yml`.
 
-```
-devc .              Install template + start container in current directory
-devc up             Start the devcontainer
-devc rebuild        Rebuild container (preserves persistent volumes)
-devc down           Stop the container
-devc shell          Open zsh shell in container
-devc exec CMD       Execute command inside the container
-devc upgrade        Upgrade Claude Code in the container
-devc mount SRC DST  Add a bind mount (host → container)
-devc cp CONT HOST   Copy files/directories from container to host
-devc firewall CMD   Manage container network firewall (on/off/status)
-devc template DIR   Copy devcontainer files to directory
-devc self-install   Install devc to ~/.local/bin
-devc update         Update devc to latest version
-```
+## Adding a Project
 
-## File Sharing
+To include a project's dev toolchain in the image, create a local wrapper
+flake that wires the project's devShell into `mkDevContainer`. The project
+must have a `flake.nix` with a `devShells` output.
 
-### `devc mount`
-
-To make a host directory available inside the container:
+### 1. Copy the template
 
 ```bash
-devc mount ~/drop /drop           # Read-write
-devc mount ~/secrets /secrets --readonly
+mkdir -p ~/.config/jedi
+cp local.flake.template.nix ~/.config/jedi/flake.nix
 ```
 
-This adds a bind mount to `docker-compose.yml` and recreates the container.
+### 2. Edit `~/.config/jedi/flake.nix`
 
-**Tip:** A shared "drop folder" is useful for passing files in without mounting your entire home directory.
+Add your project as a flake input and wire its devShell:
 
-> **Security note:** Avoid mounting large host directories (e.g., `$HOME`). Every mounted path is writable from inside the container unless `--readonly` is specified, which undermines the filesystem isolation this project provides.
+```nix
+{
+  inputs = {
+    devcontainer.url = "path:/path/to/claude-code-devcontainer";
+    foo.url = "path:/home/user/code/foo";
+  };
+
+  outputs = { devcontainer, ... }@inputs: let
+    system = "x86_64-linux";
+    mkDevContainer = devcontainer.lib.${system}.mkDevContainer;
+  in {
+    packages.${system}.container = mkDevContainer {
+      projectShells = [
+        inputs.foo.devShells.${system}.default
+      ];
+    };
+  };
+}
+```
+
+### 3. Build the image with the project's toolchain
+
+```bash
+cd ~/.config/jedi
+nix build .#container -L
+docker load < result
+```
+
+The resulting image contains the base tools **plus** everything from foo's
+devShell (`nativeBuildInputs` + `buildInputs`).
+
+### 4. Mount the project source and start
+
+Create `docker-compose.override.yml` next to the base `docker-compose.yml`:
+
+```yaml
+services:
+  shell:
+    volumes:
+      - /home/user/code/foo:/workspace/foo
+```
+
+```bash
+cd /path/to/claude-code-devcontainer
+docker compose up -d
+docker compose exec shell zsh
+cd /workspace/foo
+```
+
+### Multiple projects
+
+Add more inputs and shells — deps are merged (assumes compatible toolchains):
+
+```nix
+{
+  inputs = {
+    devcontainer.url = "path:/path/to/claude-code-devcontainer";
+    foo.url = "path:/home/user/code/foo";
+    bar.url = "github:owner/bar";
+  };
+
+  outputs = { devcontainer, ... }@inputs: let
+    system = "x86_64-linux";
+    mkDevContainer = devcontainer.lib.${system}.mkDevContainer;
+  in {
+    packages.${system}.container = mkDevContainer {
+      projectShells = [
+        inputs.foo.devShells.${system}.default
+        inputs.bar.devShells.${system}.default
+      ];
+    };
+  };
+}
+```
+
+### Quick one-off (no wrapper flake)
+
+For a single project, you can skip the wrapper and override the input directly:
+
+```bash
+nix build .#container \
+  --override-input project path:/home/user/code/foo -L
+```
+
+This uses the `project` input slot declared in the base flake.
+
+## File Layout
+
+| File | Role | Who edits |
+|------|------|-----------|
+| `flake.nix` | Base flake — exports `lib.mkDevContainer` + base image | Maintained upstream |
+| `lib/mkDevContainer.nix` | Image builder function | Maintained upstream |
+| `local.flake.template.nix` | Template for user's local wrapper | Copy + edit |
+| `docker-compose.yml` | Runtime config (volumes, caps) | Maintained upstream |
+| `docker-compose.override.yml` | Project source mounts | User creates (gitignored) |
+| `config/` | Shell config (.zshrc, .tmux.conf, etc.) | Maintained upstream |
+
+## `mkDevContainer` Options
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `projectShell` | derivation | `null` | Single devShell (convenience) |
+| `projectShells` | list | `[]` | Multiple devShells |
+| `extraPackages` | list | `[]` | Additional packages |
+| `skills` | attrset | Anthropic + ToB skills | Skill repos |
+| `extraEnv` | attrset | `{}` | Extra environment variables |
+| `extraFakeRootCommands` | string | `""` | Extra image setup commands |
+| `name` | string | `"claude-sandbox"` | Image name |
+| `tag` | string | `"latest"` | Image tag |
 
 ## Network Isolation
 
-By default, containers have full outbound network access. Use `devc firewall` to restrict egress to an allowlist of domains.
-
-### When to Enable Network Isolation
-
-- Reviewing code that may contain malicious dependencies
-- Auditing software with telemetry or phone-home behavior
-- Maximum isolation for highly sensitive reviews
-
-### Usage
+By default, containers have full outbound network access. Use firewall
+rules to restrict egress to an allowlist of domains.
 
 ```bash
-devc firewall on                # Enable with default allowlist
-devc firewall on ./rules.conf   # Enable with custom allowlist
-devc firewall status            # Show current iptables rules
-devc firewall off               # Disable (restore full access)
+# From the host, using docker compose exec:
+docker compose exec --user root shell bash -c \
+  'iptables -F OUTPUT && \
+   iptables -A OUTPUT -d api.anthropic.com -j ACCEPT && \
+   iptables -A OUTPUT -o lo -j ACCEPT && \
+   iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT && \
+   iptables -A OUTPUT -j DROP'
 ```
 
-The default allowlist (`config/firewall-defaults.conf`) permits:
+The default allowlist (`config/firewall-defaults.conf`) permits only
+`api.anthropic.com`. Additional domains are available as commented-out
+entries.
 
-- `api.anthropic.com` — Claude API
-
-Additional domains (GitHub, npm, PyPI) are available as commented-out entries in the config file.
-
-### Custom Rules
-
-Copy the defaults and edit:
-
-```bash
-cp config/firewall-defaults.conf my-rules.conf
-# Edit my-rules.conf — one domain per line, # for comments
-devc firewall on ./my-rules.conf
-```
-
-### How It Works
-
-Firewall rules are applied from the host via `docker compose exec --user root`, not via sudo inside the container. This means the unprivileged container user cannot modify or disable the rules — they are locked down after setup.
-
-### Trade-offs
-
-- Blocks package managers unless you allowlist registries
-- May break tools that require network access
-- DNS resolution still works (consider blocking if paranoid)
+Rules are applied as root from the host — the unprivileged container user
+cannot modify or disable them.
 
 ## Security Model
 
@@ -179,11 +250,11 @@ This devcontainer provides **filesystem isolation** but not complete sandboxing.
 
 **Sandboxed:** Filesystem (host files inaccessible), processes (isolated from host), package installations (stay in container)
 
-**Not sandboxed:** Network (full outbound by default—see [Network Isolation](#network-isolation)), Docker socket (not mounted by default)
+**Not sandboxed:** Network (full outbound by default—see above), Docker socket (not mounted)
 
 The container auto-configures `bypassPermissions` mode—Claude runs commands without confirmation. This would be risky on a host machine, but the container itself is the sandbox.
 
-For a detailed analysis of what remains exposed, known gaps, and future hardening directions, see [SECURITY.md](SECURITY.md).
+For a detailed analysis, see [SECURITY.md](SECURITY.md).
 
 ## Container Details
 
@@ -192,22 +263,30 @@ For a detailed analysis of what remains exposed, known gaps, and future hardenin
 | Base | Nix (`dockerTools.buildLayeredImage`), Node.js 22, Python 3.13 + uv, zsh |
 | User | Unprivileged (UID 1000, no sudo), working dir `/workspace` |
 | Tools | `rg`, `fd`, `fzf`, `delta`, `ast-grep`, `tmux`, `jq`, `vim`, `iptables`, `ipset` |
-| Volumes (survive rebuilds) | Command history (`/commandhistory`), Claude config (`/env/.claude`) |
-| Host mounts | None by default |
-| Auto-configured | Claude Code (via [llm-agents.nix](https://github.com/numtide/llm-agents.nix)), [anthropics](https://github.com/anthropics/skills) + [trailofbits](https://github.com/trailofbits/skills) skills, git-delta |
+| Volumes | Command history (`/commandhistory`), Claude config (`/env/.claude`) |
+| Skills | [anthropics/skills](https://github.com/anthropics/skills), [trailofbits/skills](https://github.com/trailofbits/skills), [trailofbits/skills-curated](https://github.com/trailofbits/skills-curated) |
 
-All packages and config are baked into the image at build time via Nix — no runtime downloads. Skills are stored in the Nix store and referenced by path. Volumes persist shell history and Claude settings across rebuilds.
+All packages and config are baked into the image at build time — no runtime downloads.
 
 ## Troubleshooting
 
 ### Container won't start
 
 1. Check Docker is running
-2. Try rebuilding: `devc rebuild`
+2. Try rebuilding: `nix build .#container -L && docker load < result`
 3. Check logs: `docker logs $(docker ps -lq)`
 
+### Path input not picking up changes
 
-### Python/uv not working
+`path:` flake inputs are locked by `narHash`. After modifying a project:
+
+```bash
+cd ~/.config/jedi
+nix flake update foo
+nix build .#container -L
+```
+
+### Python/uv
 
 Python is managed via uv:
 
@@ -215,20 +294,4 @@ Python is managed via uv:
 uv run script.py              # Run a script
 uv add package                # Add project dependency
 uv run --with requests py.py  # Ad-hoc dependency
-```
-
-## Development
-
-Build the image manually:
-
-```bash
-nix build .#container -L
-docker load < result
-```
-
-Test the container:
-
-```bash
-docker compose up -d
-docker compose exec shell zsh
 ```
