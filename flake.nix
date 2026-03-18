@@ -75,6 +75,12 @@
         };
       };
 
+      # ── Dev shell ─────────────────────────────────────────────────
+      devShells.${system}.default = pkgs.mkShell {
+        packages = [ self.packages.${system}.jedi ];
+        shellHook = ''export HOLOCRONIX_URL="path:$PWD"'';
+      };
+
       # ── Apps ───────────────────────────────────────────────────────
       apps.${system} = {
         jedi = {
