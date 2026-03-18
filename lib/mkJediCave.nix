@@ -148,6 +148,19 @@ let
       touch "$HOME/.jedicave-initialized"
       echo "[jedicave] Setup complete."
     fi
+
+    # Clone bare repos from /repos/ into /workspace/
+    if [ -d /repos ]; then
+      for bare in /repos/*.git; do
+        [ -d "$bare" ] || continue
+        repo_name=$(basename "$bare" .git)
+        if [ ! -d "/workspace/$repo_name" ]; then
+          echo "[jedicave] Cloning $repo_name..."
+          git clone "$bare" "/workspace/$repo_name"
+        fi
+      done
+    fi
+
     exec sleep infinity
   '';
 
