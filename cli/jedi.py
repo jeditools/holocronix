@@ -90,7 +90,7 @@ FLAKE_TEMPLATE = """\
     holocronix.url = "{holocronix_url}";
 
     # Add project flake inputs here:
-    # my-project.url = "path:/home/user/code/my-project";
+    # my-project.url = "path:/home/yoda/code/my-project";
   }};
 
   outputs = {{ holocronix, ... }}@inputs: let

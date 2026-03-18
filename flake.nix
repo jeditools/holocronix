@@ -9,7 +9,7 @@
     skills-tob-curated = { url = "github:trailofbits/skills-curated"; flake = false; };
 
     # Project slot — override at build time:
-    #   nix build .#container --override-input project path:/home/user/code/my-project
+    #   nix build .#container --override-input project path:/home/yoda/code/my-project
     # Defaults to nixpkgs (no devShells, so no project deps included).
     project.follows = "nixpkgs";
   };
