@@ -84,7 +84,7 @@ input and wire its devShell:
 {
   inputs = {
     holocronix.url = "github:jeditools/holocronix";
-    foo.url = "path:/home/user/code/foo";
+    foo.url = "path:/home/yoda/code/foo";
   };
 
   outputs = { holocronix, ... }@inputs: let
@@ -119,7 +119,7 @@ Create `~/.config/jedicaves/dagobah/compose.override.yml` for source mounts:
 services:
   shell:
     volumes:
-      - /home/user/code/foo:/workspace/foo
+      - /home/yoda/code/foo:/workspace/foo
 ```
 
 ### 4. Build
@@ -174,7 +174,7 @@ When only one cave exists, the name can be omitted.
 │  Cave flake.nix                                            │
 │  ┌──────────────────────┐  ┌────────────────────────────┐  │
 │  │ input: holocronix    │  │ input: foo (your project)  │  │
-│  │ (this repo)          │  │ path:/home/user/code/foo   │  │
+│  │ (this repo)          │  │ path:/home/yoda/code/foo   │  │
 │  └──────────┬───────────┘  └──────────────┬─────────────┘  │
 │             │                              │                │
 │             ▼                              ▼                │
@@ -201,7 +201,7 @@ Add more inputs and shells — deps are merged (assumes compatible toolchains):
 {
   inputs = {
     holocronix.url = "github:jeditools/holocronix";
-    foo.url = "path:/home/user/code/foo";
+    foo.url = "path:/home/yoda/code/foo";
     bar.url = "github:owner/bar";
   };
 

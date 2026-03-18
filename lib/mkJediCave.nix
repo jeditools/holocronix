@@ -153,8 +153,8 @@ let
   defaultEnv = {
     PATH = "${env}/bin";
     SHELL = "${pkgs.zsh}/bin/zsh";
-    USER = "user";
-    HOME = "/home/user";
+    USER = "yoda";
+    HOME = "/home/yoda";
     TERM = "xterm-256color";
     LANG = "C.UTF-8";
     DEVCONTAINER = "true";
@@ -165,8 +165,8 @@ let
     NODE_OPTIONS = "--max-old-space-size=4096";
     CLAUDE_CONFIG_DIR = "/env/.claude";
     ZSH = "${pkgs.oh-my-zsh}/share/oh-my-zsh";
-    ZSH_CACHE_DIR = "/home/user/.cache/oh-my-zsh";
-    GIT_CONFIG_GLOBAL = "/home/user/.gitconfig.local";
+    ZSH_CACHE_DIR = "/home/yoda/.cache/oh-my-zsh";
+    GIT_CONFIG_GLOBAL = "/home/yoda/.gitconfig.local";
     UV_LINK_MODE = "copy";
     PYTHONDONTWRITEBYTECODE = "1";
     PIP_DISABLE_PIP_VERSION_CHECK = "1";
@@ -198,22 +198,22 @@ in pkgs.dockerTools.buildLayeredImage {
   };
   fakeRootCommands = ''
     # Directories
-    mkdir -p ./home/user/.cache/oh-my-zsh ./workspace ./commandhistory
+    mkdir -p ./home/yoda/.cache/oh-my-zsh ./workspace ./commandhistory
     mkdir -p -m 1777 ./tmp
     mkdir -p ./env/.claude/plugins ./etc
 
     # User database
     echo 'root:x:0:0:root:/root:${pkgs.bashInteractive}/bin/bash' > ./etc/passwd
-    echo 'user:x:1000:1000:user:/home/user:${pkgs.zsh}/bin/zsh' >> ./etc/passwd
+    echo 'yoda:x:1000:1000:yoda:/home/yoda:${pkgs.zsh}/bin/zsh' >> ./etc/passwd
     echo 'root:x:0:' > ./etc/group
-    echo 'user:x:1000:' >> ./etc/group
+    echo 'yoda:x:1000:' >> ./etc/group
     cp ${nsswitch} ./etc/nsswitch.conf
 
     # Shell / editor config
-    cp ${configDir}/.zshrc          ./home/user/.zshrc
-    cp ${configDir}/.tmux.conf      ./home/user/.tmux.conf
-    cp ${configDir}/gitignore_global ./home/user/.gitignore_global
-    cp ${gitconfigLocal}           ./home/user/.gitconfig.local
+    cp ${configDir}/.zshrc          ./home/yoda/.zshrc
+    cp ${configDir}/.tmux.conf      ./home/yoda/.tmux.conf
+    cp ${configDir}/gitignore_global ./home/yoda/.gitignore_global
+    cp ${gitconfigLocal}           ./home/yoda/.gitconfig.local
 
     # Claude settings
     cp ${claudeSettings}      ./env/.claude/settings.json
@@ -223,7 +223,7 @@ in pkgs.dockerTools.buildLayeredImage {
     touch ./commandhistory/.bash_history ./commandhistory/.zsh_history
 
     # Ownership
-    chown -R 1000:1000 ./home/user ./workspace ./commandhistory ./env
+    chown -R 1000:1000 ./home/yoda ./workspace ./commandhistory ./env
 
     ${extraFakeRootCommands}
   '';
