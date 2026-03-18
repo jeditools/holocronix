@@ -103,6 +103,9 @@ let
     (builtins.toJSON skillEntries);
 
   gitconfigLocal = pkgs.writeText "gitconfig.local" ''
+    [user]
+        name = Yoda
+        email = yoda@jedicave.kyb
     [core]
         excludesfile = ~/.gitignore_global
         pager = delta
