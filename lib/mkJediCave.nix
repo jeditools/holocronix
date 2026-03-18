@@ -53,7 +53,7 @@ let
     gcc gnumake binutils pkg-config systemdLibs
 
     # Sandboxing / network
-    bubblewrap socat dnsutils ipset iptables iproute2
+    bubblewrap socat dnsutils iputils ipset iptables iproute2
 
     # Languages
     python315 uv nodejs_22
