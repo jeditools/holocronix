@@ -11,8 +11,7 @@ from pathlib import Path
 CAVES_DIR = Path(os.environ.get("JEDI_CAVES_DIR", Path.home() / ".config" / "jedicaves"))
 COMPOSE_SERVICE = "shell"
 
-# Resolve the holocronix directory (where this repo lives)
-HOLOCRONIX_DIR = Path(__file__).resolve().parent.parent
+HOLOCRONIX_URL_DEFAULT = "github:jeditools/holocronix"
 
 
 def cave_dir(name: str) -> Path:
@@ -107,6 +106,17 @@ FLAKE_TEMPLATE = """\
 }}
 """
 
+FIREWALL_DEFAULTS = """\
+# Default allowlisted domains for jedi firewall
+# One domain per line. Lines starting with # are comments.
+api.anthropic.com
+# github.com
+# raw.githubusercontent.com
+# registry.npmjs.org
+# pypi.org
+# files.pythonhosted.org
+"""
+
 COMPOSE_TEMPLATE = """\
 services:
   shell:
@@ -127,7 +137,7 @@ services:
       #   services:
       #     shell:
       #       volumes:
-      #         - /home/user/code/my-project:/workspace/my-project
+      #         - /home/yoda/code/my-project:/workspace/my-project
 
 volumes:
   {name}-history:
@@ -146,7 +156,7 @@ def cmd_init(args: argparse.Namespace) -> None:
 
     d.mkdir(parents=True, exist_ok=True)
 
-    holocronix_url = f"path:{HOLOCRONIX_DIR}"
+    holocronix_url = args.holocronix_url or os.environ.get("HOLOCRONIX_URL", HOLOCRONIX_URL_DEFAULT)
 
     flake_path = d / "flake.nix"
     flake_path.write_text(FLAKE_TEMPLATE.format(name=name, holocronix_url=holocronix_url))
@@ -154,10 +164,8 @@ def cmd_init(args: argparse.Namespace) -> None:
     compose_path = d / "compose.yml"
     compose_path.write_text(COMPOSE_TEMPLATE.format(name=name))
 
-    # Copy firewall config
-    fw_src = HOLOCRONIX_DIR / "config" / "firewall-defaults.conf"
-    if fw_src.exists():
-        (d / "firewall-defaults.conf").write_text(fw_src.read_text())
+    # Write default firewall config
+    (d / "firewall-defaults.conf").write_text(FIREWALL_DEFAULTS)
 
     success(f"Cave '{name}' created at {d}")
     info(f"Next steps:")
@@ -300,6 +308,8 @@ def main() -> None:
     # init
     p = sub.add_parser("init", help="Create a new cave")
     p.add_argument("name", help="Cave name")
+    p.add_argument("--holocronix-url", default=None,
+                   help=f"Holocronix flake URL (default: {HOLOCRONIX_URL_DEFAULT})")
     p.set_defaults(func=cmd_init)
 
     # build
