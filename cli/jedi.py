@@ -66,6 +66,35 @@ def run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subproce
     return subprocess.run(cmd, cwd=cwd, check=check)
 
 
+def is_cave_running(d: Path) -> bool:
+    """Check if the cave's container is running."""
+    result = subprocess.run(
+        ["docker", "compose", "ps", "-q", COMPOSE_SERVICE],
+        cwd=d, capture_output=True, text=True
+    )
+    return bool(result.stdout.strip())
+
+
+def firewall_commands(d: Path) -> str:
+    """Build the iptables command string from firewall-defaults.conf."""
+    config = d / "firewall-defaults.conf"
+    if not config.exists():
+        die(f"No firewall config at {config}")
+
+    domains = [
+        line.strip() for line in config.read_text().splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+
+    cmds = ["iptables -F OUTPUT"]
+    for domain in domains:
+        cmds.append(f"iptables -A OUTPUT -d {domain} -j ACCEPT")
+    cmds.append("iptables -A OUTPUT -o lo -j ACCEPT")
+    cmds.append("iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT")
+    cmds.append("iptables -A OUTPUT -j DROP")
+    return " && ".join(cmds)
+
+
 def check_deps() -> None:
     missing = []
     if not shutil.which("nix"):
@@ -202,7 +231,13 @@ def cmd_up(args: argparse.Namespace) -> None:
     name, d = resolve_cave(args.name)
     info(f"Starting cave '{name}'...")
     run(["docker", "compose", "up", "-d"], cwd=d)
-    success(f"Cave '{name}' running")
+    if args.firewall:
+        fw_cmds = firewall_commands(d)
+        run(["docker", "compose", "exec", "--user", "root", COMPOSE_SERVICE,
+             "bash", "-c", fw_cmds], cwd=d)
+        success(f"Cave '{name}' running (firewall on)")
+    else:
+        success(f"Cave '{name}' running")
     info(f"Run: jedi enter {name}")
 
 
@@ -216,8 +251,16 @@ def cmd_down(args: argparse.Namespace) -> None:
 def cmd_shell(args: argparse.Namespace) -> None:
     """Ephemeral shell — starts a new container, removed on exit."""
     name, d = resolve_cave(args.name)
-    os.execvp("docker", ["docker", "compose", "--project-directory", str(d),
-                          "run", "--rm", "-it", COMPOSE_SERVICE, "zsh"])
+    if args.firewall:
+        fw_cmds = firewall_commands(d)
+        # Start as root, apply firewall, drop to user
+        os.execvp("docker", ["docker", "compose", "--project-directory", str(d),
+                              "run", "--rm", "-it", "--user", "root",
+                              COMPOSE_SERVICE, "bash", "-c",
+                              f"{fw_cmds} && exec su -s /bin/zsh yoda"])
+    else:
+        os.execvp("docker", ["docker", "compose", "--project-directory", str(d),
+                              "run", "--rm", "-it", COMPOSE_SERVICE, "zsh"])
 
 
 def cmd_enter(args: argparse.Namespace) -> None:
@@ -254,25 +297,19 @@ def cmd_firewall(args: argparse.Namespace) -> None:
     name, d = resolve_cave(args.name)
     action = args.action
 
+    if not is_cave_running(d):
+        die(f"Cave '{name}' is not running. Start it first:\n"
+            f"  jedi up {name}\n"
+            f"  jedi up --firewall {name}\n"
+            f"Or use: jedi shell --firewall {name}")
+
     if action == "on":
-        config = d / "firewall-defaults.conf"
-        if not config.exists():
-            die(f"No firewall config at {config}")
-
-        domains = [
-            line.strip() for line in config.read_text().splitlines()
-            if line.strip() and not line.strip().startswith("#")
-        ]
-
-        cmds = ["iptables -F OUTPUT"]
-        for domain in domains:
-            cmds.append(f"iptables -A OUTPUT -d {domain} -j ACCEPT")
-        cmds.append("iptables -A OUTPUT -o lo -j ACCEPT")
-        cmds.append("iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT")
-        cmds.append("iptables -A OUTPUT -j DROP")
-
+        fw_cmds = firewall_commands(d)
         run(["docker", "compose", "exec", "--user", "root", COMPOSE_SERVICE,
-             "bash", "-c", " && ".join(cmds)], cwd=d)
+             "bash", "-c", fw_cmds], cwd=d)
+        config = d / "firewall-defaults.conf"
+        domains = [l.strip() for l in config.read_text().splitlines()
+                   if l.strip() and not l.strip().startswith("#")]
         success(f"Firewall enabled ({len(domains)} domains allowlisted)")
 
     elif action == "off":
@@ -281,8 +318,28 @@ def cmd_firewall(args: argparse.Namespace) -> None:
         success("Firewall disabled")
 
     elif action == "status":
-        run(["docker", "compose", "exec", "--user", "root", COMPOSE_SERVICE,
-             "iptables", "-L", "-n", "-v"], cwd=d)
+        result = subprocess.run(
+            ["docker", "compose", "exec", "--user", "root", COMPOSE_SERVICE,
+             "iptables", "-L", "OUTPUT", "-n"],
+            cwd=d, capture_output=True, text=True
+        )
+        lines = result.stdout.strip().splitlines()
+        # Parse OUTPUT chain rules
+        rules = [l for l in lines[2:] if l.strip()] if len(lines) > 2 else []
+        has_drop = any("DROP" in r for r in rules)
+        accept_ips = [r.split()[4] for r in rules if "ACCEPT" in r and r.split()[4] != "0.0.0.0/0"]
+
+        if has_drop:
+            success("Firewall: ON")
+            if accept_ips:
+                info(f"Allowed destinations: {', '.join(accept_ips)}")
+        else:
+            warn("Firewall: OFF (all traffic allowed)")
+
+        if args.verbose:
+            print()
+            run(["docker", "compose", "exec", "--user", "root", COMPOSE_SERVICE,
+                 "iptables", "-L", "-n", "-v"], cwd=d)
 
 
 def cmd_destroy(args: argparse.Namespace) -> None:
@@ -322,6 +379,7 @@ def main() -> None:
     # up
     p = sub.add_parser("up", help="Start cave container")
     p.add_argument("name", nargs="?", help="Cave name")
+    p.add_argument("--firewall", action="store_true", help="Enable firewall on startup")
     p.set_defaults(func=cmd_up)
 
     # down
@@ -332,6 +390,7 @@ def main() -> None:
     # shell (ephemeral)
     p = sub.add_parser("shell", help="Ephemeral shell (no 'up' needed)")
     p.add_argument("name", nargs="?", help="Cave name")
+    p.add_argument("--firewall", action="store_true", help="Enable firewall")
     p.set_defaults(func=cmd_shell)
 
     # enter (a running cave)
@@ -353,6 +412,7 @@ def main() -> None:
     p = sub.add_parser("firewall", help="Manage cave firewall")
     p.add_argument("action", choices=["on", "off", "status"])
     p.add_argument("name", nargs="?", help="Cave name")
+    p.add_argument("-v", "--verbose", action="store_true", help="Show full iptables output")
     p.set_defaults(func=cmd_firewall)
 
     # destroy
