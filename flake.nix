@@ -49,6 +49,8 @@
         then project.devShells.${system}.default
         else null;
 
+      jediPython = pkgs.python314.withPackages (ps: [ ps.typer ]);
+
     in {
       # ── Library ──────────────────────────────────────────────────────
       lib.${system}.mkJediCave = mkJediCave;
@@ -70,7 +72,7 @@
             mkdir -p $out/bin
             install -m 755 $src/jedi.py $out/bin/jedi
             wrapProgram $out/bin/jedi \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.python3 ]}
+              --prefix PATH : ${pkgs.lib.makeBinPath [ jediPython ]}
           '';
         };
       };
