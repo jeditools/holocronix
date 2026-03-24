@@ -124,8 +124,36 @@ FLAKE_TEMPLATE = """\
   inputs = {{
     holocronix.url = "{holocronix_url}";
 
-    # Add project flake inputs here:
-    # my-project.url = "path:/home/yoda/code/my-project";
+    # Add project flake inputs here, e.g.:
+    #
+    # Plain directory (copies as-is, includes uncommitted changes):
+    #   my-project.url = "path:/home/yoda/code/my-project";
+    #
+    # Local git repo (committed state only):
+    #   my-project.url = "git+file:///home/yoda/code/my-project";
+    #
+    # Local git repo, specific branch:
+    #   my-project.url = "git+file:///home/yoda/code/my-project?ref=dev";
+    #
+    # Local git repo, specific commit:
+    #   my-project.url = "git+file:///home/yoda/code/my-project?rev=abc1234";
+    #
+    # Local git repo, branch + commit:
+    #   my-project.url = "git+file:///home/yoda/code/my-project?ref=dev&rev=abc1234";
+    #
+    # GitHub repo:
+    #   my-project.url = "github:owner/repo";
+    #   my-project.url = "github:owner/repo/branch-or-rev";
+    #
+    # Generic git remote:
+    #   my-project.url = "git+https://example.com/owner/repo.git";
+    #   my-project.url = "git+https://example.com/owner/repo.git?ref=main";
+    #
+    # FlakeHub:
+    #   my-project.url = "https://flakehub.com/f/owner/repo/0.1.*.tar.gz";
+    #
+    # Nixpkgs (pinned):
+    #   nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
   }};
 
   outputs = {{ holocronix, ... }}@inputs: let
