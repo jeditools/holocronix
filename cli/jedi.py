@@ -323,23 +323,15 @@ def update(
 @app.command()
 def build(
     name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
-    update: Annotated[Optional[list[str]], typer.Option(
-        help="Update inputs before building (specific inputs, or omit for all)",
-        show_default=False,
-    )] = None,
+    update: Annotated[bool, typer.Option("--update", "-u", help="Update all flake inputs before building")] = False,
 ):
     """Build cave image."""
     check_deps()
     name, d = resolve_cave(name)
 
-    if update is not None:
-        if update:
-            for inp in update:
-                console.print(f"Updating input [cyan]{inp}[/]...")
-                run(["nix", "flake", "update", inp], cwd=d)
-        else:
-            console.print("Updating all inputs...")
-            run(["nix", "flake", "update"], cwd=d)
+    if update:
+        console.print("Updating all inputs...")
+        run(["nix", "flake", "update"], cwd=d)
 
     console.print(f"Building cave [cyan]{name}[/]...")
     run(["nix", "build", ".#container", "--print-build-logs"], cwd=d)
