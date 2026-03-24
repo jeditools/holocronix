@@ -4,7 +4,7 @@
 # Returns a function that takes project-specific options and produces
 # a dockerTools.buildLayeredImage derivation.
 
-{ pkgs, claude-code, defaultSkills ? {} }:
+{ pkgs, claude-code, defaultSkills ? {}, defaultClaudeSettings ? {}, defaultPlugins ? [] }:
 
 {
   # Project devShells to extract deps from (nativeBuildInputs + buildInputs).
@@ -32,6 +32,15 @@
   # Git identity
   gitUser ? "Yoda",
   gitEmail ? "yoda@jedicave.kyb",
+
+  # Claude Code settings (attrset, converted to JSON)
+  claudeSettings ? defaultClaudeSettings,
+
+  # Plugins to auto-install on first boot (overrides defaults)
+  plugins ? defaultPlugins,
+
+  # Additional plugins (extends the list above)
+  extraPlugins ? [],
 }:
 
 let
@@ -72,26 +81,8 @@ let
 
   # ── Config files ─────────────────────────────────────────────────────
 
-  claudeSettings = pkgs.writeText "claude-settings.json" ''
-    {
-      "permissions": {
-        "defaultMode": "bypassPermissions"
-      },
-      "hooks": {
-        "PreToolUse": [
-          {
-            "matcher": "Bash",
-            "hooks": [
-              {
-                "type": "command",
-                "command": "cmd=$(cat | jq -r .tool_input.command); if printf '%s' \"$cmd\" | grep -qiE '\\bgit\\s+push\\b|\\bgit\\s+commit\\b|\\bgh\\s+'; then echo 'BLOCKED: git push, git commit, and gh commands are not allowed in this container' >&2; exit 2; fi"
-              }
-            ]
-          }
-        ]
-      }
-    }
-  '';
+  claudeSettingsFile = pkgs.writeText "claude-settings.json"
+    (builtins.toJSON claudeSettings);
 
   # Build skills marketplace entries from the attrset
   # Each skill has { repo, path } where repo is "owner/repo" for GitHub skills
@@ -142,7 +133,7 @@ let
       mkdir -p "$CLAUDE_CONFIG_DIR/plugins"
 
       [ -f "$CLAUDE_CONFIG_DIR/settings.json" ] || \
-        cp ${claudeSettings} "$CLAUDE_CONFIG_DIR/settings.json"
+        cp ${claudeSettingsFile} "$CLAUDE_CONFIG_DIR/settings.json"
 
       [ -f "$CLAUDE_CONFIG_DIR/plugins/known_marketplaces.json" ] || \
         cp ${knownMarketplaces} "$CLAUDE_CONFIG_DIR/plugins/known_marketplaces.json"
@@ -150,7 +141,7 @@ let
       chmod -R u+rw "$CLAUDE_CONFIG_DIR" 2>/dev/null || true
 
       # Install plugins
-      claude plugin install ralph-wiggum@claude-code-plugins
+      ${builtins.concatStringsSep "\n      " (map (p: "claude plugin install ${p}") (plugins ++ extraPlugins))}
 
       touch "$HOME/.jedicave-initialized"
       echo "[jedicave] Setup complete."
@@ -239,7 +230,7 @@ in pkgs.dockerTools.buildLayeredImage {
     cp ${gitconfigLocal}           ./home/yoda/.gitconfig.local
 
     # Claude settings
-    cp ${claudeSettings}      ./env/.claude/settings.json
+    cp ${claudeSettingsFile}      ./env/.claude/settings.json
     cp ${knownMarketplaces}   ./env/.claude/plugins/known_marketplaces.json
 
     # Shell history placeholders
