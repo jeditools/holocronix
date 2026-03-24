@@ -1,16 +1,19 @@
 # mkJediCave — build a sandboxed container image for coding agents
 #
-# Called from flake.nix with { pkgs, claude-code, defaultSkills }.
+# Called from flake.nix with { pkgs, defaultAgents, defaultSkills, ... }.
 # Returns a function that takes project-specific options and produces
 # a dockerTools.buildLayeredImage derivation.
 
-{ pkgs, claude-code, defaultSkills ? {}, defaultClaudeSettings ? {}, defaultPlugins ? [] }:
+{ pkgs, defaultAgents ? {}, defaultSkills ? {}, defaultClaudeSettings ? {}, defaultPlugins ? [] }:
 
 {
   # Project devShells to extract deps from (nativeBuildInputs + buildInputs).
   # Pass one via projectShell, or many via projectShells.
   projectShell ? null,
   projectShells ? [],
+
+  # AI agents to include (attrset of name → package)
+  agents ? defaultAgents,
 
   # Additional packages to include
   extraPackages ? [],
@@ -52,12 +55,11 @@ let
     (shell.nativeBuildInputs or []) ++ (shell.buildInputs or [])
   ) allShells;
 
+  agentPackages = builtins.attrValues agents;
+
   jedicavePackages = with pkgs; [
     # Core
     coreutils bashInteractive zsh git cacert
-
-    # AI tooling
-    claude-code
 
     # CLI tools
     fd ripgrep gnugrep fzf delta tmux ast-grep jq nano unzip vim curl oh-my-zsh gnused gawk less poppler-utils
@@ -70,7 +72,7 @@ let
 
     # Languages
     python315 uv nodejs_22
-  ] ++ projectDeps ++ extraPackages;
+  ] ++ agentPackages ++ projectDeps ++ extraPackages;
 
   env = pkgs.buildEnv {
     name = "jedicave-env";
@@ -125,11 +127,10 @@ let
 
   # ── Entrypoint ───────────────────────────────────────────────────────
 
-  entrypoint = pkgs.writeShellScriptBin "jedicave-start" ''
-    if [ ! -f "$HOME/.jedicave-initialized" ]; then
-      echo "[jedicave] First-boot setup..."
+  hasClaude = agents ? claude-code;
 
-      # Claude config (CLAUDE_CONFIG_DIR is typically a Docker volume)
+  claudeSetup = ''
+      # Claude Code config (CLAUDE_CONFIG_DIR is typically a Docker volume)
       mkdir -p "$CLAUDE_CONFIG_DIR/plugins"
 
       [ -f "$CLAUDE_CONFIG_DIR/settings.json" ] || \
@@ -142,6 +143,13 @@ let
 
       # Install plugins
       ${builtins.concatStringsSep "\n      " (map (p: "claude plugin install ${p}") (plugins ++ extraPlugins))}
+  '';
+
+  entrypoint = pkgs.writeShellScriptBin "jedicave-start" ''
+    if [ ! -f "$HOME/.jedicave-initialized" ]; then
+      echo "[jedicave] First-boot setup..."
+
+      ${if hasClaude then claudeSetup else ""}
 
       touch "$HOME/.jedicave-initialized"
       echo "[jedicave] Setup complete."
@@ -230,8 +238,10 @@ in pkgs.dockerTools.buildLayeredImage {
     cp ${gitconfigLocal}           ./home/yoda/.gitconfig.local
 
     # Claude settings
+    ${if hasClaude then ''
     cp ${claudeSettingsFile}      ./env/.claude/settings.json
     cp ${knownMarketplaces}   ./env/.claude/plugins/known_marketplaces.json
+    '' else ""}
 
     # Shell history placeholders
     touch ./commandhistory/.bash_history ./commandhistory/.zsh_history
