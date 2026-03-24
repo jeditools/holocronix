@@ -346,6 +346,25 @@ def down(
 
 
 @app.command()
+def restart(
+    name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
+    firewall: Annotated[bool, typer.Option(help="Enable firewall on startup")] = True,
+):
+    """Restart cave container (down + up)."""
+    name, d = resolve_cave(name)
+    console.print(f"Restarting cave [cyan]{name}[/]...")
+    run(["docker", "compose", "down"], cwd=d)
+    run(["docker", "compose", "up", "-d"], cwd=d)
+    if firewall:
+        fw_cmds = firewall_commands(d)
+        run(["docker", "compose", "exec", "--user", "root", COMPOSE_SERVICE,
+             "bash", "-c", fw_cmds], cwd=d)
+        console.print(f"[green]Cave '{name}' restarted (firewall on)[/]")
+    else:
+        console.print(f"[green]Cave '{name}' restarted[/]")
+
+
+@app.command()
 def shell(
     name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
     firewall: Annotated[bool, typer.Option(help="Enable firewall")] = True,
