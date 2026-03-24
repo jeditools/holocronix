@@ -10,7 +10,7 @@ This document describes what the jedicave isolates, what it does not, and where 
 | Processes | Isolated | PID/mount/UTS/IPC namespaces |
 | Privileges | Hardened | No sudo, no setuid; firewall rules immutable from container user |
 | NPM scripts | Hardened | Disabled by default (`IGNORE_SCRIPTS=true`, 24h release age gate) |
-| Network | Open by default | Full egress; use `jedi firewall on` to allowlist |
+| Network | Firewalled by default | Egress restricted to allowlist; use `jedi firewall off` to open |
 | DNS | Open | Not filtered even with firewall; tunneling possible |
 | Kernel | Shared | Host kernel exposed; container escape via kernel vuln possible |
 | Resources | Unlimited | No CPU/memory/PID limits configured |
@@ -48,9 +48,9 @@ This document describes what the jedicave isolates, what it does not, and where 
 
 The container shares the host Linux kernel. A kernel vulnerability exploitable from within the container could compromise the host. This is the fundamental limitation of OS-level containerization versus hardware virtualization (VMs).
 
-### Network (by default)
+### Network
 
-Containers have full outbound network access unless `jedi firewall on` is used. Even with the firewall enabled:
+The firewall is enabled by default, restricting outbound access to allowlisted domains. It can be disabled with `jedi firewall off` or `--no-firewall`. Even with the firewall enabled:
 
 - **DNS is not blocked.** DNS queries still resolve for all domains. A malicious process could use DNS tunneling to exfiltrate data or receive commands. Blocking DNS entirely would break name resolution for allowlisted domains, so this is a trade-off.
 - **Exfiltration via allowed domains.** Data can be exfiltrated through any allowlisted endpoint. For example, if `github.com` is allowed, a process could push data to an attacker-controlled repository.

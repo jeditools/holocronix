@@ -245,22 +245,24 @@ Add more inputs and shells — deps are merged (assumes compatible toolchains):
 
 ## Network Isolation
 
-By default, caves have full outbound network access. Use the firewall to
-restrict egress to an allowlist of domains:
-
-```bash
-jedi firewall on dagobah
-```
-
-The default allowlist (`firewall-defaults.conf`) permits only
-`api.anthropic.com`. Edit it to add more domains.
+The firewall is **enabled by default** — caves start with egress restricted
+to an allowlist of domains. The default allowlist (`firewall-defaults.conf`)
+permits only `api.anthropic.com`. Edit it to add more domains.
 
 Rules are applied as root — the unprivileged container user cannot modify
 or disable them.
 
 ```bash
-jedi firewall off dagobah     # Restore full access
 jedi firewall status dagobah  # Show current rules
+jedi firewall off dagobah     # Disable firewall (full outbound access)
+jedi firewall on dagobah      # Re-enable firewall
+```
+
+To start a cave without the firewall:
+
+```bash
+jedi up --no-firewall dagobah
+jedi shell --no-firewall dagobah
 ```
 
 ## Rebuilding After Changes
@@ -384,7 +386,7 @@ jedi seed ~/code/foo dagobah
 
 **Sandboxed:** Filesystem (host files inaccessible except mounts), processes (isolated namespaces), packages (stay in container)
 
-**Not sandboxed:** Network (full outbound by default), kernel (shared with host)
+**Not sandboxed:** Kernel (shared with host). Network egress is firewalled by default but can be disabled.
 
 The container auto-configures `bypassPermissions` — Claude runs commands
 without confirmation. This is safe because the container itself is the
