@@ -853,23 +853,32 @@ def harvest(
             ["git", "--git-dir", str(bare), "config", "jedicave.seededCount"],
             capture_output=True, text=True,
         )
-        seeded_count = int(seeded_result.stdout.strip()) if seeded_result.returncode == 0 and seeded_result.stdout.strip() else 0
-        agent_total = total_count - seeded_count
+        has_seeded_count = seeded_result.returncode == 0 and seeded_result.stdout.strip()
+        seeded_count = int(seeded_result.stdout.strip()) if has_seeded_count else None
 
         console.print(f"\n[cyan]{repo_name}[/]")
 
         if new_count > 0:
             summary = f"  [green]+{new_count} new[/]"
-            if agent_total > new_count:
-                summary += f" ({agent_total} by agent, {total_count} total)"
+            if seeded_count is not None:
+                agent_total = total_count - seeded_count
+                if agent_total > new_count:
+                    summary += f" ({agent_total} by agent, {total_count} total)"
+                else:
+                    summary += f" ({total_count} total)"
             else:
                 summary += f" ({total_count} total)"
             console.print(summary)
             console.print(agent_log)
-        elif agent_total > 0:
-            console.print(f"  [dim]No new commits[/] ({agent_total} by agent, {total_count} total)")
         elif old_tips:
-            console.print(f"  [dim]No new commits[/] ({total_count} total)")
+            if seeded_count is not None:
+                agent_total = total_count - seeded_count
+                if agent_total > 0:
+                    console.print(f"  [dim]No new commits[/] ({agent_total} by agent, {total_count} total)")
+                else:
+                    console.print(f"  [dim]No new commits[/] ({total_count} total)")
+            else:
+                console.print(f"  [dim]No new commits[/] ({total_count} total)")
         else:
             # No pre-harvest tips means repo was empty before — all commits are agent's
             result = subprocess.run(
