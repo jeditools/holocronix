@@ -28,6 +28,10 @@
 
   # Extra commands to run in fakeRootCommands (string)
   extraFakeRootCommands ? "",
+
+  # Git identity
+  gitUser ? "Yoda",
+  gitEmail ? "yoda@jedicave.kyb",
 }:
 
 let
@@ -104,8 +108,8 @@ let
 
   gitconfigLocal = pkgs.writeText "gitconfig.local" ''
     [user]
-        name = Yoda
-        email = yoda@jedicave.kyb
+        name = ${gitUser}
+        email = ${gitEmail}
     [core]
         excludesfile = ~/.gitignore_global
         pager = delta
