@@ -22,7 +22,9 @@
     let
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
-      claude-code = llm-agents.packages.${system}.claude-code;
+      defaultAgents = {
+        inherit (llm-agents.packages.${system}) claude-code opencode qwen-code;
+      };
 
       defaultSkills = {
         skills = {
@@ -48,7 +50,7 @@
       defaultPlugins = defaults.plugins;
 
       mkJediCave = import ./lib/mkJediCave.nix {
-        inherit pkgs claude-code defaultSkills defaultClaudeSettings defaultPlugins;
+        inherit pkgs defaultAgents defaultSkills defaultClaudeSettings defaultPlugins;
       };
 
       # Resolve project devShell if the input provides one, otherwise empty.
@@ -64,7 +66,7 @@
     in {
       # ── Library ──────────────────────────────────────────────────────
       lib.${system} = {
-        inherit mkJediCave defaultClaudeSettings defaultPlugins;
+        inherit mkJediCave defaultAgents defaultClaudeSettings defaultPlugins;
       };
 
       # ── Packages ─────────────────────────────────────────────────────
@@ -73,7 +75,7 @@
           inherit projectShell;
         };
         default = self.packages.${system}.container;
-        inherit claude-code;
+      } // defaultAgents // {
 
         jedi = pkgs.stdenvNoCC.mkDerivation {
           pname = "jedi";
