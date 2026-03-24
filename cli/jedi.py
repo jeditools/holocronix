@@ -384,6 +384,52 @@ def exec(
                           "exec", COMPOSE_SERVICE] + ctx.args)
 
 
+@app.command()
+def cp(
+    src: Annotated[str, typer.Argument(help="Source path (prefix with : for container path)")],
+    dst: Annotated[str, typer.Argument(help="Destination path (prefix with : for container path)")],
+    name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
+):
+    """Copy files between host and cave container.
+
+    Prefix container paths with : (colon).
+
+    \b
+    Examples:
+      jedi cp :/env/.claude/projects/foo/bar.md ./bar.md
+      jedi cp ./config.yml :/workspace/project/config.yml
+    """
+    name, d = resolve_cave(name)
+
+    if not is_cave_running(d):
+        err_console.print(f"[red]Cave '{name}' is not running.[/] Start it first: jedi up {name}")
+        raise typer.Exit(1)
+
+    container_id = subprocess.run(
+        ["docker", "compose", "ps", "-q", COMPOSE_SERVICE],
+        cwd=d, capture_output=True, text=True,
+    ).stdout.strip()
+
+    if not container_id:
+        err_console.print(f"[red]Could not find container for cave '{name}'[/]")
+        raise typer.Exit(1)
+
+    if src.startswith(":") and dst.startswith(":"):
+        err_console.print("[red]Both paths are container paths. One must be a host path.[/]")
+        raise typer.Exit(1)
+
+    if not src.startswith(":") and not dst.startswith(":"):
+        err_console.print("[red]Neither path is a container path. Prefix container paths with :[/]")
+        raise typer.Exit(1)
+
+    if src.startswith(":"):
+        # Container → host
+        run(["docker", "cp", f"{container_id}:{src[1:]}", dst])
+    else:
+        # Host → container
+        run(["docker", "cp", src, f"{container_id}:{dst[1:]}"])
+
+
 @app.command("list")
 def list_cmd():
     """List caves."""
