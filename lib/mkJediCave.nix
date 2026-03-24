@@ -51,7 +51,7 @@ let
     claude-code
 
     # CLI tools
-    fd ripgrep fzf delta tmux ast-grep jq nano unzip vim curl oh-my-zsh gnused less
+    fd ripgrep gnugrep fzf delta tmux ast-grep jq nano unzip vim curl oh-my-zsh gnused less
 
     # Build tools
     gcc gnumake binutils pkg-config systemdLibs
