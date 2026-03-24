@@ -62,6 +62,10 @@ def _list_caves() -> list[str]:
     )
 
 
+def complete_cave_name(incomplete: str) -> list[str]:
+    return [name for name in _list_caves() if name.startswith(incomplete)]
+
+
 def run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
     console.print(f"[dim]  {' '.join(cmd)}[/]")
     return subprocess.run(cmd, cwd=cwd, check=check)
@@ -182,7 +186,7 @@ volumes:
 
 @app.command()
 def init(
-    name: Annotated[str, typer.Argument(help="Cave name")],
+    name: Annotated[str, typer.Argument(help="Cave name", autocompletion=complete_cave_name)],
     holocronix_url: Annotated[Optional[str], typer.Option(help="Holocronix flake URL")] = None,
 ):
     """Create a new cave."""
@@ -210,7 +214,7 @@ def init(
 
 @app.command()
 def inputs(
-    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+    name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
 ):
     """List flake inputs and their locked revisions."""
     check_deps()
@@ -259,7 +263,7 @@ def inputs(
 @app.command()
 def update(
     input: Annotated[Optional[str], typer.Argument(help="Specific input to update (default: all)")] = None,
-    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+    name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
 ):
     """Update flake inputs (lock only, no build)."""
     check_deps()
@@ -279,7 +283,7 @@ def update(
 
 @app.command()
 def build(
-    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+    name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
     update: Annotated[Optional[list[str]], typer.Option(
         help="Update inputs before building (specific inputs, or omit for all)",
         show_default=False,
@@ -313,7 +317,7 @@ def build(
 
 @app.command()
 def up(
-    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+    name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
     firewall: Annotated[bool, typer.Option(help="Enable firewall on startup")] = True,
 ):
     """Start cave container."""
@@ -332,7 +336,7 @@ def up(
 
 @app.command()
 def down(
-    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+    name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
 ):
     """Stop cave container."""
     name, d = resolve_cave(name)
@@ -343,7 +347,7 @@ def down(
 
 @app.command()
 def shell(
-    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+    name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
     firewall: Annotated[bool, typer.Option(help="Enable firewall")] = True,
 ):
     """Ephemeral shell (no 'up' needed)."""
@@ -361,7 +365,7 @@ def shell(
 
 @app.command()
 def enter(
-    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+    name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
 ):
     """Enter a running cave (requires 'up')."""
     name, d = resolve_cave(name)
@@ -372,7 +376,7 @@ def enter(
 @app.command(context_settings={"allow_extra_args": True, "allow_interspersed_args": False})
 def exec(
     ctx: typer.Context,
-    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+    name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
 ):
     """Run a command in a running cave (requires 'up')."""
     name, d = resolve_cave(name)
@@ -411,7 +415,7 @@ class FirewallAction(str, Enum):
 @app.command()
 def firewall(
     action: Annotated[FirewallAction, typer.Argument(help="Firewall action")],
-    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+    name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
     verbose: Annotated[bool, typer.Option("-v", "--verbose", help="Show full iptables output")] = False,
 ):
     """Manage cave firewall."""
@@ -467,7 +471,7 @@ def firewall(
 @app.command()
 def seed(
     repo_path: Annotated[str, typer.Argument(help="Path to source git repo")],
-    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+    name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
     branch: Annotated[Optional[str], typer.Option(help="Branch to seed (default: current branch)")] = None,
 ):
     """Seed a repo into the cave as a bare repo for secure git handoff."""
@@ -539,7 +543,7 @@ def seed(
 @app.command()
 def unseed(
     repo_name: Annotated[str, typer.Argument(help="Repo name to remove")],
-    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+    name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
     yes: Annotated[bool, typer.Option("-y", "--yes", help="Skip confirmation")] = False,
 ):
     """Remove a seeded bare repo from the cave."""
@@ -559,7 +563,7 @@ def unseed(
 
 @app.command()
 def harvest(
-    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+    name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
 ):
     """Show agent commits in cave repos and how to fetch them."""
     name, d = resolve_cave(name)
@@ -613,7 +617,7 @@ def harvest(
 
 @app.command("dir")
 def dir_cmd(
-    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+    name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
 ):
     """Print cave directory path."""
     _name, d = resolve_cave(name)
@@ -622,7 +626,7 @@ def dir_cmd(
 
 @app.command()
 def show(
-    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+    name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
 ):
     """Show cave overview."""
     name, d = resolve_cave(name)
@@ -685,7 +689,7 @@ def show(
 
 @app.command()
 def logs(
-    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+    name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
     follow: Annotated[bool, typer.Option("-f", "--follow", help="Follow log output")] = False,
     tail: Annotated[Optional[int], typer.Option("-n", "--tail", help="Number of lines from end")] = None,
 ):
@@ -701,7 +705,7 @@ def logs(
 
 @app.command()
 def destroy(
-    name: Annotated[str, typer.Argument(help="Cave name")],
+    name: Annotated[str, typer.Argument(help="Cave name", autocompletion=complete_cave_name)],
     yes: Annotated[bool, typer.Option("-y", "--yes", help="Skip confirmation")] = False,
 ):
     """Delete a cave."""
