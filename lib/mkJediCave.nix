@@ -149,6 +149,9 @@ let
 
       chmod -R u+rw "$CLAUDE_CONFIG_DIR" 2>/dev/null || true
 
+      # Install plugins
+      claude plugin install ralph-wiggum@claude-code-plugins
+
       touch "$HOME/.jedicave-initialized"
       echo "[jedicave] Setup complete."
     fi
