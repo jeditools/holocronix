@@ -150,10 +150,27 @@
         "type": "github"
       }
     },
+    "plugins-official": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1773981295,
+        "narHash": "sha256-Dd3AZzGvVsXACixRdmQcEHT7FwPxOyGnvI67ypj+i+Y=",
+        "owner": "anthropics",
+        "repo": "claude-plugins-official",
+        "rev": "b664e152af5742dd11b6a6e5d7a65848a8c5a261",
+        "type": "github"
+      },
+      "original": {
+        "owner": "anthropics",
+        "repo": "claude-plugins-official",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "llm-agents": "llm-agents",
         "nixpkgs": "nixpkgs_2",
+        "plugins-official": "plugins-official",
         "project": [
           "nixpkgs"
         ],

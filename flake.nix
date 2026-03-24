@@ -7,6 +7,7 @@
     skills-anthropic = { url = "github:anthropics/skills"; flake = false; };
     skills-tob = { url = "github:trailofbits/skills"; flake = false; };
     skills-tob-curated = { url = "github:trailofbits/skills-curated"; flake = false; };
+    plugins-official = { url = "github:anthropics/claude-plugins-official"; flake = false; };
 
     # Project slot — override at build time:
     #   nix build .#container --override-input project path:/home/yoda/code/my-project
@@ -16,6 +17,7 @@
 
   outputs = inputs@{ self, nixpkgs, llm-agents
                    , skills-anthropic, skills-tob, skills-tob-curated
+                   , plugins-official
                    , project, ... }:
     let
       system = "x86_64-linux";
@@ -34,6 +36,10 @@
         trailofbits-skills-curated = {
           repo = "trailofbits/skills-curated";
           path = skills-tob-curated;
+        };
+        claude-plugins-official = {
+          repo = "anthropics/claude-plugins-official";
+          path = plugins-official;
         };
       };
 
