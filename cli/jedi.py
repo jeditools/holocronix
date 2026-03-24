@@ -204,7 +204,7 @@ def init(
     console.print(f"[green]Cave '{name}' created at {d}[/]")
     console.print("Next steps:")
     console.print(f"  1. Edit {d / 'flake.nix'} — add your project inputs and devShells")
-    console.print(f"  2. Create {d}/compose.override.yml for project mounts")
+    console.print(f"  2. Seed your project: jedi seed <repo-path> {name}")
     console.print(f"  3. Run: jedi build {name}")
 
 
