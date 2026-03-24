@@ -17,9 +17,12 @@ machine is risky — they can execute any command without confirmation. A
 jedicave provides **filesystem isolation** so you get the productivity
 benefits of autonomous agents without risking your host system.
 
-Currently ships with [Claude Code](https://claude.ai) via
-[llm-agents.nix](https://github.com/numtide/llm-agents.nix). Support
-for additional agents is planned.
+Ships with multiple AI coding agents via
+[llm-agents.nix](https://github.com/numtide/llm-agents.nix):
+[Claude Code](https://claude.ai),
+[OpenCode](https://github.com/opencode-ai/opencode), and
+[Qwen Code](https://github.com/QwenLM/qwen-code).
+The agent set is configurable per cave.
 
 **Designed for:**
 
@@ -204,7 +207,7 @@ When only one cave exists, the name can be omitted.
 
 | Layer | What's included | Source |
 |-------|-----------------|--------|
-| **Base** | Claude Code, zsh, git, ripgrep, tmux, Python, Node.js, build tools, firewall | `lib/mkJediCave.nix` |
+| **Base** | AI agents (Claude Code, OpenCode, Qwen Code), zsh, git, ripgrep, tmux, Python, Node.js, build tools, firewall | `lib/mkJediCave.nix` |
 | **Project** | Compiler, cross-toolchain, build deps from the project's devShell | Project's `flake.nix` |
 | **Runtime** | Source code (cloned from seeded bare repos), persistent volumes for config/history | `compose.yml` |
 
@@ -240,8 +243,12 @@ Add more inputs and shells — deps are merged (assumes compatible toolchains):
 |-----------|------|---------|-------------|
 | `projectShell` | derivation | `null` | Single devShell (convenience) |
 | `projectShells` | list | `[]` | Multiple devShells |
+| `agents` | attrset | `defaultAgents` | AI agents to include (name → package) |
 | `extraPackages` | list | `[]` | Additional Nix packages |
-| `skills` | attrset | Anthropic + ToB skills | Skill repos |
+| `skills` | attrset | Anthropic + ToB skills | Skill repos (Claude Code) |
+| `claudeSettings` | attrset | see `defaults.json` | Claude Code settings |
+| `plugins` | list | see `defaults.json` | Claude plugins to install |
+| `extraPlugins` | list | `[]` | Additional Claude plugins |
 | `extraEnv` | attrset | `{}` | Extra environment variables |
 | `extraFakeRootCommands` | string | `""` | Extra image setup commands |
 | `name` | string | `"jedicave"` | Image name |
@@ -392,9 +399,9 @@ jedi seed ~/code/foo dagobah
 
 **Not sandboxed:** Kernel (shared with host). Network egress is firewalled by default but can be disabled.
 
-The container auto-configures `bypassPermissions` — Claude runs commands
-without confirmation. This is safe because the container itself is the
-sandbox boundary.
+The container auto-configures Claude Code with `bypassPermissions` —
+agents run commands without confirmation. This is safe because the
+container itself is the sandbox boundary.
 
 For a detailed analysis, see [SECURITY.md](SECURITY.md).
 
@@ -403,6 +410,7 @@ For a detailed analysis, see [SECURITY.md](SECURITY.md).
 | Component | Details |
 |-----------|---------|
 | Base | Nix (`dockerTools.buildLayeredImage`), Node.js 22, Python 3.15 + uv, zsh |
+| Agents | Claude Code, OpenCode, Qwen Code (configurable via `agents`) |
 | User | Unprivileged (UID 1000, no sudo), working dir `/workspace` |
 | Tools | `rg`, `fd`, `fzf`, `delta`, `ast-grep`, `tmux`, `jq`, `vim`, `iptables`, `ipset` |
 | Volumes | Command history (`/commandhistory`), Claude config (`/env/.claude`) |
