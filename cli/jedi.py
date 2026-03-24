@@ -388,7 +388,7 @@ def exec(
 def cp(
     src: Annotated[str, typer.Argument(help="Source path (prefix with : for container path)")],
     dst: Annotated[str, typer.Argument(help="Destination path (prefix with : for container path)")],
-    name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
+    name: Annotated[Optional[str], typer.Option("--cave", "-c", help="Cave name", autocompletion=complete_cave_name)] = None,
 ):
     """Copy files between host and cave container.
 
