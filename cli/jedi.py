@@ -680,6 +680,75 @@ def seed(
 
 
 @app.command()
+def reseed(
+    repo_name: Annotated[Optional[str], typer.Argument(help="Repo name (default: all)")] = None,
+    name: Annotated[Optional[str], typer.Option("--cave", "-c", help="Cave name", autocompletion=complete_cave_name)] = None,
+    all_branches: Annotated[bool, typer.Option("--all", help="Push all branches")] = False,
+):
+    """Re-push host repo commits into seeded bare repos."""
+    name, d = resolve_cave(name)
+    repos_dir = d / "repos"
+
+    if not repos_dir.exists():
+        console.print("No repos seeded. Run: jedi seed <repo-path>")
+        return
+
+    bare_repos = sorted(
+        p for p in repos_dir.iterdir()
+        if p.is_dir() and p.name.endswith(".git")
+    )
+
+    if repo_name:
+        bare_repos = [p for p in bare_repos if p.name == f"{repo_name}.git"]
+        if not bare_repos:
+            err_console.print(f"[red]No seeded repo '{repo_name}' in cave '{name}'[/]")
+            raise typer.Exit(1)
+
+    for bare in bare_repos:
+        rn = bare.name[:-4]
+
+        source_result = subprocess.run(
+            ["git", "--git-dir", str(bare), "config", "jedicave.sourceRepo"],
+            capture_output=True, text=True,
+        )
+        source_repo = source_result.stdout.strip()
+
+        if not source_repo or not Path(source_repo).is_dir():
+            err_console.print(f"[yellow]Skipping '{rn}': source repo not found at {source_repo}[/]")
+            continue
+
+        if all_branches:
+            result = run(["git", "push", str(bare), "--all"],
+                         cwd=Path(source_repo), check=False)
+        else:
+            # Push the current branch of the source repo
+            branch_result = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=source_repo, capture_output=True, text=True,
+            )
+            branch = branch_result.stdout.strip()
+            if not branch or branch == "HEAD":
+                err_console.print(f"[yellow]Skipping '{rn}': detached HEAD, use --all[/]")
+                continue
+            result = run(["git", "push", str(bare),
+                          f"refs/heads/{branch}:refs/heads/{branch}"],
+                         cwd=Path(source_repo), check=False)
+
+        if result.returncode == 0:
+            # Update seeded count
+            count_result = subprocess.run(
+                ["git", "--git-dir", str(bare), "rev-list", "--all", "--count"],
+                capture_output=True, text=True,
+            )
+            if count_result.returncode == 0:
+                run(["git", "--git-dir", str(bare), "config",
+                     "jedicave.seededCount", count_result.stdout.strip()], check=False)
+            console.print(f"[green]Reseeded '{rn}'[/]")
+        else:
+            err_console.print(f"[red]Failed to reseed '{rn}'[/]")
+
+
+@app.command()
 def unseed(
     repo_name: Annotated[str, typer.Argument(help="Repo name to remove")],
     name: Annotated[Optional[str], typer.Option("--cave", "-c", help="Cave name", autocompletion=complete_cave_name)] = None,
