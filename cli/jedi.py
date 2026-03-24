@@ -582,6 +582,62 @@ def harvest(
         console.print("No repos seeded. Run: jedi seed <repo-path>")
         return
 
+    running = is_cave_running(d)
+
+    # Sync agent commits from container into bare repos via bundle
+    if running:
+        container_id = subprocess.run(
+            ["docker", "compose", "ps", "-q", COMPOSE_SERVICE],
+            cwd=d, capture_output=True, text=True,
+        ).stdout.strip()
+
+        for bare in bare_repos:
+            rn = bare.name[:-4]
+            workdir = f"/workspace/{rn}"
+            bundle_path = f"/tmp/{rn}.bundle"
+
+            # Check if repo exists in container
+            check = subprocess.run(
+                ["docker", "compose", "exec", COMPOSE_SERVICE, "test", "-d", workdir],
+                cwd=d, capture_output=True,
+            )
+            if check.returncode != 0:
+                continue
+
+            # Create bundle inside container
+            result = subprocess.run(
+                ["docker", "compose", "exec", "-w", workdir, COMPOSE_SERVICE,
+                 "git", "bundle", "create", bundle_path, "--all"],
+                cwd=d, capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                err_console.print(f"[yellow]Could not bundle '{rn}': {result.stderr.strip()}[/]")
+                continue
+
+            # Copy bundle out via docker cp
+            host_bundle = d / "repos" / f"{rn}.bundle"
+            result = subprocess.run(
+                ["docker", "cp", f"{container_id}:{bundle_path}", str(host_bundle)],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                err_console.print(f"[yellow]Could not extract bundle for '{rn}'[/]")
+                continue
+
+            # Fetch bundle into bare repo (update branch refs)
+            result = subprocess.run(
+                ["git", "--git-dir", str(bare), "fetch", str(host_bundle),
+                 "+refs/heads/*:refs/heads/*"],
+                capture_output=True, text=True,
+            )
+            if result.returncode == 0:
+                fetched = [l for l in result.stderr.strip().splitlines() if "->" in l]
+                if fetched:
+                    console.print(f"[green]Harvested new commits:[/] {rn}")
+
+            # Clean up bundle
+            host_bundle.unlink(missing_ok=True)
+
     for bare in bare_repos:
         repo_name = bare.name[:-4]
 
@@ -592,7 +648,7 @@ def harvest(
         )
         source_repo = source_result.stdout.strip()
 
-        # Show branches and recent commits
+        # Show branches and recent commits (including harvested refs)
         result = subprocess.run(
             ["git", "--git-dir", str(bare), "log", "--all",
              "--oneline", "--graph", "-15"],
@@ -611,8 +667,80 @@ def harvest(
         else:
             console.print(f"    cd /path/to/{repo_name}")
         console.print(f"    git fetch {bare}")
-        console.print(f"    git log FETCH_HEAD")
+        console.print(f"    git log HEAD..FETCH_HEAD")
         console.print(f"    git diff HEAD..FETCH_HEAD")
+
+    if running:
+        console.print(f"\n[dim]Tip: use 'jedi diff' to see uncommitted changes still inside the container[/]")
+    else:
+        console.print(f"\n[yellow]Cave is stopped — only showing previously harvested commits.[/]")
+        console.print(f"[yellow]Run 'jedi harvest' while the cave is running to sync agent commits.[/]")
+
+
+@app.command()
+def diff(
+    name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
+    repo_name: Annotated[Optional[str], typer.Option("--repo", "-r", help="Specific repo (default: all)")] = None,
+    stat: Annotated[bool, typer.Option("--stat", help="Show diffstat instead of full diff")] = False,
+):
+    """Show uncommitted changes in workspace repos (requires running cave)."""
+    name, d = resolve_cave(name)
+
+    if not is_cave_running(d):
+        err_console.print(f"[red]Cave '{name}' is not running.[/] Start it first: jedi up {name}")
+        raise typer.Exit(1)
+
+    # Discover repos inside the container
+    if repo_name:
+        repos = [repo_name]
+    else:
+        result = subprocess.run(
+            ["docker", "compose", "exec", COMPOSE_SERVICE,
+             "sh", "-c", "ls -d /workspace/*/.git 2>/dev/null | xargs -I{} dirname {}"],
+            cwd=d, capture_output=True, text=True,
+        )
+        if not result.stdout.strip():
+            console.print("No git repos found in /workspace/")
+            return
+        repos = [Path(p).name for p in result.stdout.strip().splitlines()]
+
+    for rn in repos:
+        workdir = f"/workspace/{rn}"
+
+        # Check repo exists
+        check = subprocess.run(
+            ["docker", "compose", "exec", COMPOSE_SERVICE, "test", "-d", workdir],
+            cwd=d, capture_output=True,
+        )
+        if check.returncode != 0:
+            err_console.print(f"[red]Repo '{rn}' not found in /workspace/[/]")
+            continue
+
+        console.print(f"\n[cyan bold]{rn}[/]")
+
+        # Tracked changes
+        diff_cmd = "git diff HEAD --stat" if stat else "git diff HEAD"
+        result = subprocess.run(
+            ["docker", "compose", "exec", "-w", workdir, COMPOSE_SERVICE,
+             "sh", "-c", diff_cmd],
+            cwd=d, capture_output=True, text=True,
+        )
+        if result.stdout.strip():
+            console.print(result.stdout.rstrip())
+        else:
+            console.print("  [dim]no tracked changes[/]")
+
+        # Untracked files
+        result = subprocess.run(
+            ["docker", "compose", "exec", "-w", workdir, COMPOSE_SERVICE,
+             "git", "ls-files", "--others", "--exclude-standard"],
+            cwd=d, capture_output=True, text=True,
+        )
+        untracked = result.stdout.strip().splitlines()
+        if untracked:
+            console.print(f"\n  [yellow]Untracked files ({len(untracked)}):[/]")
+            for f in untracked:
+                console.print(f"    {f}")
 
 
 @app.command("dir")
