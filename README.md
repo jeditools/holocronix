@@ -1,5 +1,9 @@
 # Holocronix
 
+> **⚠️ Active Development:** This project is under heavy development and
+> things change frequently. The best way to use `jedi` is to clone this
+> repo and run `nix develop`.
+
 A Nix flake library for building sandboxed containers. Bake project
 toolchains into reproducible OCI images and run AI coding agents safely
 inside isolated environments.
