@@ -15,7 +15,7 @@ from rich.table import Table
 
 app = typer.Typer(
     name="jedi",
-    help="Manage jedicaves — sandboxed containers",
+    help="Manage [blue]jedicaves[/blue] — sandboxed containers. Run [green bold]jedi guide[/green bold] for a step-by-step walkthrough.",
     no_args_is_help=True,
     rich_markup_mode="rich",
 )
@@ -685,6 +685,50 @@ def show(
         for source_file, vol in volume_lines:
             label = f" [dim]({source_file})[/]" if source_file == "compose.override.yml" else ""
             console.print(f"    {vol}{label}")
+
+
+@app.command()
+def guide():
+    """Step-by-step walkthrough for setting up a new cave."""
+    console.print(
+        "\n"
+        "[bold]Setting up a new jedicave (reproducible offline-capable sandboxed container)[/]\n"
+        "\n"
+        "[bold cyan]1. Create the cave[/]\n"
+        "   jedi init my-cave\n"
+        "   Creates scaffolding at ~/.config/jedicaves/my-cave/\n"
+        "\n"
+        "[bold cyan]2. Configure the flake[/]\n"
+        "   Edit the generated flake.nix to add your project inputs\n"
+        "   and devShells. The file has commented examples.\n"
+        "   jedi show my-cave         # see cave path and details\n"
+        "\n"
+        "[bold cyan]3. Build the container image[/]\n"
+        "   jedi build my-cave\n"
+        "   Builds with Nix and loads the image into Docker.\n"
+        "\n"
+        "[bold cyan]4. Seed your source code[/]\n"
+        "   jedi seed ~/code/my-project my-cave\n"
+        "   Pushes a branch into a bare repo inside the cave.\n"
+        "   The container auto-clones it to /workspace/my-project.\n"
+        "\n"
+        "[bold cyan]5. Launch[/]\n"
+        "   jedi up my-cave            # start in background\n"
+        "   jedi enter my-cave         # attach a shell\n"
+        "   [dim]or[/]\n"
+        "   jedi shell my-cave         # one-shot ephemeral shell\n"
+        "\n"
+        "[bold cyan]6. Check progress & harvest results[/]\n"
+        "   jedi diff my-cave            # uncommitted changes inside container\n"
+        "   jedi harvest my-cave         # committed work + fetch commands\n"
+        "\n"
+        "[bold cyan]Other useful commands[/]\n"
+        "   jedi list                  # list all caves\n"
+        "   jedi firewall status       # check firewall state\n"
+        "   jedi inputs my-cave        # show locked flake inputs\n"
+        "   jedi logs -f my-cave       # follow container logs\n"
+        "   jedi destroy my-cave       # tear down a cave\n"
+    )
 
 
 @app.command()
