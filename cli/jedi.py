@@ -1,42 +1,59 @@
 #!/usr/bin/env python3
 """jedi — CLI for managing jedicaves (sandboxed containers)."""
 
-import argparse
 import json
 import os
 import shutil
 import subprocess
-import sys
+from enum import Enum
 from pathlib import Path
+from typing import Annotated, Optional
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+app = typer.Typer(
+    name="jedi",
+    help="Manage jedicaves — sandboxed containers",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+
+console = Console()
+err_console = Console(stderr=True)
 
 CAVES_DIR = Path(os.environ.get("JEDI_CAVES_DIR", Path.home() / ".config" / "jedicaves"))
 COMPOSE_SERVICE = "shell"
-
 HOLOCRONIX_URL_DEFAULT = "github:jeditools/holocronix"
 
+
+# --- Helpers ---
 
 def cave_dir(name: str) -> Path:
     return CAVES_DIR / name
 
 
 def resolve_cave(name: str | None) -> tuple[str, Path]:
-    """Resolve a cave name to (name, path). Infer if only one cave exists."""
     if name:
         d = cave_dir(name)
         if not d.exists():
-            die(f"Cave '{name}' not found. Run: jedi list")
+            err_console.print(f"[red]Cave '{name}' not found.[/] Run: jedi list")
+            raise typer.Exit(1)
         return name, d
 
-    caves = list_caves()
+    caves = _list_caves()
     if len(caves) == 1:
         return caves[0], cave_dir(caves[0])
     elif len(caves) == 0:
-        die("No caves found. Run: jedi init <name>")
+        err_console.print("[red]No caves found.[/] Run: jedi init <name>")
+        raise typer.Exit(1)
     else:
-        die(f"Multiple caves exist ({', '.join(caves)}). Specify one: jedi <command> <name>")
+        err_console.print(f"[red]Multiple caves exist[/] ({', '.join(caves)}). Specify one: jedi <command> <name>")
+        raise typer.Exit(1)
 
 
-def list_caves() -> list[str]:
+def _list_caves() -> list[str]:
     if not CAVES_DIR.exists():
         return []
     return sorted(
@@ -45,30 +62,12 @@ def list_caves() -> list[str]:
     )
 
 
-def die(msg: str) -> None:
-    print(f"\033[0;31m[jedi]\033[0m {msg}", file=sys.stderr)
-    sys.exit(1)
-
-
-def info(msg: str) -> None:
-    print(f"\033[0;34m[jedi]\033[0m {msg}")
-
-
-def success(msg: str) -> None:
-    print(f"\033[0;32m[jedi]\033[0m {msg}")
-
-
-def warn(msg: str) -> None:
-    print(f"\033[1;33m[jedi]\033[0m {msg}")
-
-
 def run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
-    info(f"  {' '.join(cmd)}")
+    console.print(f"[dim]  {' '.join(cmd)}[/]")
     return subprocess.run(cmd, cwd=cwd, check=check)
 
 
 def is_cave_running(d: Path) -> bool:
-    """Check if the cave's container is running."""
     result = subprocess.run(
         ["docker", "compose", "ps", "-q", COMPOSE_SERVICE],
         cwd=d, capture_output=True, text=True
@@ -77,10 +76,10 @@ def is_cave_running(d: Path) -> bool:
 
 
 def firewall_commands(d: Path) -> str:
-    """Build the iptables command string from firewall-defaults.conf."""
     config = d / "firewall-defaults.conf"
     if not config.exists():
-        die(f"No firewall config at {config}")
+        err_console.print(f"[red]No firewall config at {config}[/]")
+        raise typer.Exit(1)
 
     domains = [
         line.strip() for line in config.read_text().splitlines()
@@ -103,7 +102,10 @@ def check_deps() -> None:
     if not shutil.which("docker"):
         missing.append("docker")
     if missing:
-        die("Missing required tools:\n" + "\n".join(f"  - {m}" for m in missing))
+        err_console.print("[red]Missing required tools:[/]")
+        for m in missing:
+            err_console.print(f"  - {m}")
+        raise typer.Exit(1)
 
 
 # --- Templates ---
@@ -177,143 +179,174 @@ volumes:
 
 # --- Commands ---
 
-def cmd_init(args: argparse.Namespace) -> None:
-    name = args.name
+@app.command()
+def init(
+    name: Annotated[str, typer.Argument(help="Cave name")],
+    holocronix_url: Annotated[Optional[str], typer.Option(help="Holocronix flake URL")] = None,
+):
+    """Create a new cave."""
     d = cave_dir(name)
 
     if d.exists() and (d / "flake.nix").exists():
-        die(f"Cave '{name}' already exists at {d}")
+        err_console.print(f"[red]Cave '{name}' already exists at {d}[/]")
+        raise typer.Exit(1)
 
     d.mkdir(parents=True, exist_ok=True)
 
-    holocronix_url = args.holocronix_url or os.environ.get("HOLOCRONIX_URL", HOLOCRONIX_URL_DEFAULT)
+    url = holocronix_url or os.environ.get("HOLOCRONIX_URL", HOLOCRONIX_URL_DEFAULT)
 
-    flake_path = d / "flake.nix"
-    flake_path.write_text(FLAKE_TEMPLATE.format(name=name, holocronix_url=holocronix_url))
-
-    compose_path = d / "compose.yml"
-    compose_path.write_text(COMPOSE_TEMPLATE.format(name=name))
-
-    # Write default firewall config
+    (d / "flake.nix").write_text(FLAKE_TEMPLATE.format(name=name, holocronix_url=url))
+    (d / "compose.yml").write_text(COMPOSE_TEMPLATE.format(name=name))
     (d / "firewall-defaults.conf").write_text(FIREWALL_DEFAULTS)
 
-    success(f"Cave '{name}' created at {d}")
-    info(f"Next steps:")
-    info(f"  1. Edit {flake_path} — add your project inputs and devShells")
-    info(f"  2. Create {d}/compose.override.yml for project mounts")
-    info(f"  3. Run: jedi build {name}")
+    console.print(f"[green]Cave '{name}' created at {d}[/]")
+    console.print("Next steps:")
+    console.print(f"  1. Edit {d / 'flake.nix'} — add your project inputs and devShells")
+    console.print(f"  2. Create {d}/compose.override.yml for project mounts")
+    console.print(f"  3. Run: jedi build {name}")
 
 
-def cmd_inputs(args: argparse.Namespace) -> None:
+@app.command()
+def inputs(
+    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+):
+    """List flake inputs and their locked revisions."""
     check_deps()
-    name, d = resolve_cave(args.name)
+    name, d = resolve_cave(name)
     result = subprocess.run(
         ["nix", "flake", "metadata", "--json", "."],
         cwd=d, capture_output=True, text=True
     )
     if result.returncode != 0:
-        die(f"Failed to read flake metadata:\n{result.stderr.strip()}")
+        err_console.print(f"[red]Failed to read flake metadata:[/]\n{result.stderr.strip()}")
+        raise typer.Exit(1)
 
     meta = json.loads(result.stdout)
     locks = meta.get("locks", {}).get("nodes", {})
     root_inputs = locks.get("root", {}).get("inputs", {})
 
     if not root_inputs:
-        info(f"Cave '{name}' has no inputs")
+        console.print(f"Cave '{name}' has no inputs")
         return
 
-    info(f"Inputs for cave '{name}':")
+    table = Table(title=f"Inputs for cave '{name}'")
+    table.add_column("Input", style="cyan")
+    table.add_column("Source")
+    table.add_column("Ref", style="dim")
+    table.add_column("Rev", style="dim")
+
     for input_name, node_key in sorted(root_inputs.items()):
         node = locks.get(node_key, {})
         locked = node.get("locked", {})
         rev = locked.get("rev", "")[:12]
-        url = locked.get("url", "")
         ref = locked.get("ref", "")
         input_type = locked.get("type", "")
         if input_type == "path":
             loc = locked.get("path", "")
-        elif url:
-            loc = url
+        elif locked.get("url"):
+            loc = locked["url"]
         else:
             owner = locked.get("owner", "")
             repo = locked.get("repo", "")
             loc = f"{owner}/{repo}" if owner else ""
-        parts = [f"  {input_name:20s}"]
-        if loc:
-            parts.append(loc)
-        if ref:
-            parts.append(f"({ref})")
-        if rev:
-            parts.append(rev)
-        print(" ".join(parts))
+        table.add_row(input_name, loc, ref, rev)
+
+    console.print(table)
 
 
-def cmd_update(args: argparse.Namespace) -> None:
+@app.command()
+def update(
+    input: Annotated[Optional[str], typer.Argument(help="Specific input to update (default: all)")] = None,
+    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+):
+    """Update flake inputs (lock only, no build)."""
     check_deps()
-    name, d = resolve_cave(args.name)
+    name, d = resolve_cave(name)
 
-    if args.input:
-        info(f"Updating input '{args.input}'...")
-        result = run(["nix", "flake", "update", args.input], cwd=d, check=False)
+    if input:
+        console.print(f"Updating input [cyan]{input}[/]...")
+        result = run(["nix", "flake", "update", input], cwd=d, check=False)
     else:
-        info("Updating all inputs...")
+        console.print("Updating all inputs...")
         result = run(["nix", "flake", "update"], cwd=d, check=False)
     if result.returncode != 0:
-        die("Failed to update flake inputs")
-    success(f"Lock updated for cave '{name}'")
+        err_console.print("[red]Failed to update flake inputs[/]")
+        raise typer.Exit(1)
+    console.print(f"[green]Lock updated for cave '{name}'[/]")
 
 
-def cmd_build(args: argparse.Namespace) -> None:
+@app.command()
+def build(
+    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+    update: Annotated[Optional[str], typer.Option(
+        help="Update flake inputs before building (optionally specify one input)",
+        show_default=False,
+    )] = None,
+    update_all: Annotated[bool, typer.Option("--update-all", help="Update all flake inputs before building")] = False,
+):
+    """Build cave image."""
     check_deps()
-    name, d = resolve_cave(args.name)
+    name, d = resolve_cave(name)
 
-    if args.update is not None:
-        if args.update:
-            info(f"Updating input '{args.update}'...")
-            run(["nix", "flake", "update", args.update], cwd=d)
-        else:
-            info("Updating all inputs...")
-            run(["nix", "flake", "update"], cwd=d)
+    if update_all:
+        console.print("Updating all inputs...")
+        run(["nix", "flake", "update"], cwd=d)
+    elif update:
+        console.print(f"Updating input [cyan]{update}[/]...")
+        run(["nix", "flake", "update", update], cwd=d)
 
-    info(f"Building cave '{name}'...")
+    console.print(f"Building cave [cyan]{name}[/]...")
     run(["nix", "build", ".#container", "--print-build-logs"], cwd=d)
 
-    result = d / "result"
-    if not result.exists():
-        die("Build produced no result link")
+    result_link = d / "result"
+    if not result_link.exists():
+        err_console.print("[red]Build produced no result link[/]")
+        raise typer.Exit(1)
 
-    info("Loading image into Docker...")
-    run(["docker", "load", "-i", str(result)])
-    success(f"Cave '{name}' built and loaded")
+    console.print("Loading image into Docker...")
+    run(["docker", "load", "-i", str(result_link)])
+    console.print(f"[green]Cave '{name}' built and loaded[/]")
 
 
-def cmd_up(args: argparse.Namespace) -> None:
-    name, d = resolve_cave(args.name)
-    info(f"Starting cave '{name}'...")
+@app.command()
+def up(
+    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+    firewall: Annotated[bool, typer.Option(help="Enable firewall on startup")] = False,
+):
+    """Start cave container."""
+    name, d = resolve_cave(name)
+    console.print(f"Starting cave [cyan]{name}[/]...")
     run(["docker", "compose", "up", "-d"], cwd=d)
-    if args.firewall:
+    if firewall:
         fw_cmds = firewall_commands(d)
         run(["docker", "compose", "exec", "--user", "root", COMPOSE_SERVICE,
              "bash", "-c", fw_cmds], cwd=d)
-        success(f"Cave '{name}' running (firewall on)")
+        console.print(f"[green]Cave '{name}' running (firewall on)[/]")
     else:
-        success(f"Cave '{name}' running")
-    info(f"Run: jedi enter {name}")
+        console.print(f"[green]Cave '{name}' running[/]")
+    console.print(f"Run: jedi enter {name}")
 
 
-def cmd_down(args: argparse.Namespace) -> None:
-    name, d = resolve_cave(args.name)
-    info(f"Stopping cave '{name}'...")
+@app.command()
+def down(
+    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+):
+    """Stop cave container."""
+    name, d = resolve_cave(name)
+    console.print(f"Stopping cave [cyan]{name}[/]...")
     run(["docker", "compose", "down"], cwd=d)
-    success(f"Cave '{name}' stopped")
+    console.print(f"[green]Cave '{name}' stopped[/]")
 
 
-def cmd_shell(args: argparse.Namespace) -> None:
-    """Ephemeral shell — starts a new container, removed on exit."""
-    name, d = resolve_cave(args.name)
-    if args.firewall:
+@app.command()
+def shell(
+    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+    firewall: Annotated[bool, typer.Option(help="Enable firewall")] = False,
+):
+    """Ephemeral shell (no 'up' needed)."""
+    name, d = resolve_cave(name)
+    if firewall:
         fw_cmds = firewall_commands(d)
-        # Start as root, apply firewall, drop to user
         os.execvp("docker", ["docker", "compose", "--project-directory", str(d),
                               "run", "--rm", "-it", "--user", "root",
                               COMPOSE_SERVICE, "bash", "-c",
@@ -323,178 +356,127 @@ def cmd_shell(args: argparse.Namespace) -> None:
                               "run", "--rm", "-it", COMPOSE_SERVICE, "zsh"])
 
 
-def cmd_enter(args: argparse.Namespace) -> None:
-    """Attach to a running cave (requires 'jedi up' first)."""
-    name, d = resolve_cave(args.name)
+@app.command()
+def enter(
+    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+):
+    """Enter a running cave (requires 'up')."""
+    name, d = resolve_cave(name)
     os.execvp("docker", ["docker", "compose", "--project-directory", str(d),
                           "exec", COMPOSE_SERVICE, "zsh"])
 
 
-def cmd_exec(args: argparse.Namespace) -> None:
-    """Run a command in a running cave (requires 'jedi up' first)."""
-    name, d = resolve_cave(args.name)
+@app.command(context_settings={"allow_extra_args": True, "allow_interspersed_args": False})
+def exec(
+    ctx: typer.Context,
+    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+):
+    """Run a command in a running cave (requires 'up')."""
+    name, d = resolve_cave(name)
     os.execvp("docker", ["docker", "compose", "--project-directory", str(d),
-                          "exec", COMPOSE_SERVICE] + args.command)
+                          "exec", COMPOSE_SERVICE] + ctx.args)
 
 
-def cmd_list(args: argparse.Namespace) -> None:
-    caves = list_caves()
+@app.command("list")
+def list_cmd():
+    """List caves."""
+    caves = _list_caves()
     if not caves:
-        info("No caves found. Run: jedi init <name>")
+        console.print("No caves found. Run: jedi init <name>")
         return
+
+    table = Table()
+    table.add_column("Cave", style="cyan")
+    table.add_column("Status")
+    table.add_column("Path", style="dim")
+
     for name in caves:
         d = cave_dir(name)
-        # Check if container is running
-        result = subprocess.run(
-            ["docker", "compose", "ps", "-q", COMPOSE_SERVICE],
-            cwd=d, capture_output=True, text=True
-        )
-        status = "running" if result.stdout.strip() else "stopped"
-        print(f"  {name:20s} {status:10s} {d}")
+        running = is_cave_running(d)
+        status = "[green]running[/]" if running else "[dim]stopped[/]"
+        table.add_row(name, status, str(d))
+
+    console.print(table)
 
 
-def cmd_firewall(args: argparse.Namespace) -> None:
-    name, d = resolve_cave(args.name)
-    action = args.action
+class FirewallAction(str, Enum):
+    on = "on"
+    off = "off"
+    status = "status"
+
+
+@app.command()
+def firewall(
+    action: Annotated[FirewallAction, typer.Argument(help="Firewall action")],
+    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+    verbose: Annotated[bool, typer.Option("-v", "--verbose", help="Show full iptables output")] = False,
+):
+    """Manage cave firewall."""
+    name, d = resolve_cave(name)
 
     if not is_cave_running(d):
-        die(f"Cave '{name}' is not running. Start it first:\n"
+        err_console.print(
+            f"[red]Cave '{name}' is not running.[/] Start it first:\n"
             f"  jedi up {name}\n"
             f"  jedi up --firewall {name}\n"
-            f"Or use: jedi shell --firewall {name}")
+            f"Or use: jedi shell --firewall {name}"
+        )
+        raise typer.Exit(1)
 
-    if action == "on":
+    if action == FirewallAction.on:
         fw_cmds = firewall_commands(d)
         run(["docker", "compose", "exec", "--user", "root", COMPOSE_SERVICE,
              "bash", "-c", fw_cmds], cwd=d)
         config = d / "firewall-defaults.conf"
         domains = [l.strip() for l in config.read_text().splitlines()
                    if l.strip() and not l.strip().startswith("#")]
-        success(f"Firewall enabled ({len(domains)} domains allowlisted)")
+        console.print(f"[green]Firewall enabled ({len(domains)} domains allowlisted)[/]")
 
-    elif action == "off":
+    elif action == FirewallAction.off:
         run(["docker", "compose", "exec", "--user", "root", COMPOSE_SERVICE,
              "bash", "-c", "iptables -F && iptables -X && iptables -P OUTPUT ACCEPT"], cwd=d)
-        success("Firewall disabled")
+        console.print("[green]Firewall disabled[/]")
 
-    elif action == "status":
+    elif action == FirewallAction.status:
         result = subprocess.run(
             ["docker", "compose", "exec", "--user", "root", COMPOSE_SERVICE,
              "iptables", "-L", "OUTPUT", "-n"],
             cwd=d, capture_output=True, text=True
         )
         lines = result.stdout.strip().splitlines()
-        # Parse OUTPUT chain rules
         rules = [l for l in lines[2:] if l.strip()] if len(lines) > 2 else []
         has_drop = any("DROP" in r for r in rules)
         accept_ips = [r.split()[4] for r in rules if "ACCEPT" in r and r.split()[4] != "0.0.0.0/0"]
 
         if has_drop:
-            success("Firewall: ON")
+            console.print("[green]Firewall: ON[/]")
             if accept_ips:
-                info(f"Allowed destinations: {', '.join(accept_ips)}")
+                console.print(f"Allowed destinations: {', '.join(accept_ips)}")
         else:
-            warn("Firewall: OFF (all traffic allowed)")
+            console.print("[yellow]Firewall: OFF (all traffic allowed)[/]")
 
-        if args.verbose:
-            print()
+        if verbose:
+            console.print()
             run(["docker", "compose", "exec", "--user", "root", COMPOSE_SERVICE,
                  "iptables", "-L", "-n", "-v"], cwd=d)
 
 
-def cmd_destroy(args: argparse.Namespace) -> None:
-    name, d = resolve_cave(args.name)
+@app.command()
+def destroy(
+    name: Annotated[str, typer.Argument(help="Cave name")],
+    yes: Annotated[bool, typer.Option("-y", "--yes", help="Skip confirmation")] = False,
+):
+    """Delete a cave."""
+    name, d = resolve_cave(name)
 
-    # Stop container if running
     subprocess.run(["docker", "compose", "down"], cwd=d, capture_output=True)
 
-    if args.yes or input(f"Delete cave '{name}' at {d}? [y/N] ").lower() == "y":
+    if yes or typer.confirm(f"Delete cave '{name}' at {d}?", default=False):
         shutil.rmtree(d)
-        success(f"Cave '{name}' destroyed")
+        console.print(f"[green]Cave '{name}' destroyed[/]")
     else:
-        info("Aborted")
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        prog="jedi",
-        description="Manage jedicaves — sandboxed containers",
-    )
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    # init
-    p = sub.add_parser("init", help="Create a new cave")
-    p.add_argument("name", help="Cave name")
-    p.add_argument("--holocronix-url", default=None,
-                   help=f"Holocronix flake URL (default: {HOLOCRONIX_URL_DEFAULT})")
-    p.set_defaults(func=cmd_init)
-
-    # inputs
-    p = sub.add_parser("inputs", help="List flake inputs and their locked revisions")
-    p.add_argument("name", nargs="?", help="Cave name")
-    p.set_defaults(func=cmd_inputs)
-
-    # update
-    p = sub.add_parser("update", help="Update flake inputs (lock only)")
-    p.add_argument("input", nargs="?", help="Specific input to update (default: all)")
-    p.add_argument("name", nargs="?", help="Cave name")
-    p.set_defaults(func=cmd_update)
-
-    # build
-    p = sub.add_parser("build", help="Build cave image")
-    p.add_argument("name", nargs="?", help="Cave name")
-    p.add_argument("--update", nargs="?", const="", default=None, metavar="INPUT",
-                   help="Update flake inputs before building (optionally specify one input)")
-    p.set_defaults(func=cmd_build)
-
-    # up
-    p = sub.add_parser("up", help="Start cave container")
-    p.add_argument("name", nargs="?", help="Cave name")
-    p.add_argument("--firewall", action="store_true", help="Enable firewall on startup")
-    p.set_defaults(func=cmd_up)
-
-    # down
-    p = sub.add_parser("down", help="Stop cave container")
-    p.add_argument("name", nargs="?", help="Cave name")
-    p.set_defaults(func=cmd_down)
-
-    # shell (ephemeral)
-    p = sub.add_parser("shell", help="Ephemeral shell (no 'up' needed)")
-    p.add_argument("name", nargs="?", help="Cave name")
-    p.add_argument("--firewall", action="store_true", help="Enable firewall")
-    p.set_defaults(func=cmd_shell)
-
-    # enter (a running cave)
-    p = sub.add_parser("enter", help="Enter a running cave (requires 'up')")
-    p.add_argument("name", nargs="?", help="Cave name")
-    p.set_defaults(func=cmd_enter)
-
-    # exec (in running cave)
-    p = sub.add_parser("exec", help="Run command in running cave (requires 'up')")
-    p.add_argument("name", nargs="?", help="Cave name")
-    p.add_argument("command", nargs=argparse.REMAINDER, help="Command to run")
-    p.set_defaults(func=cmd_exec)
-
-    # list
-    p = sub.add_parser("list", help="List caves")
-    p.set_defaults(func=cmd_list)
-
-    # firewall
-    p = sub.add_parser("firewall", help="Manage cave firewall")
-    p.add_argument("action", choices=["on", "off", "status"])
-    p.add_argument("name", nargs="?", help="Cave name")
-    p.add_argument("-v", "--verbose", action="store_true", help="Show full iptables output")
-    p.set_defaults(func=cmd_firewall)
-
-    # destroy
-    p = sub.add_parser("destroy", help="Delete a cave")
-    p.add_argument("name", help="Cave name")
-    p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation")
-    p.set_defaults(func=cmd_destroy)
-
-    args = parser.parse_args()
-    args.func(args)
+        console.print("Aborted")
 
 
 if __name__ == "__main__":
-    main()
+    app(prog_name="jedi")
