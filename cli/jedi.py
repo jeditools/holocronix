@@ -262,8 +262,8 @@ def inputs(
 
 @app.command()
 def update(
-    input: Annotated[Optional[str], typer.Argument(help="Specific input to update (default: all)")] = None,
     name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
+    input: Annotated[Optional[str], typer.Option("--input", "-i", help="Specific input to update (default: all)")] = None,
 ):
     """Update flake inputs (lock only, no build)."""
     check_deps()
