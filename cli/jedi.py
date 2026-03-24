@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import subprocess
+from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Annotated, Optional
@@ -31,7 +32,11 @@ HOLOCRONIX_URL_DEFAULT = "github:jeditools/holocronix"
 # --- Helpers ---
 
 def cave_dir(name: str) -> Path:
-    return CAVES_DIR / name
+    d = (CAVES_DIR / name).resolve()
+    if not str(d).startswith(str(CAVES_DIR.resolve()) + "/"):
+        err_console.print(f"[red]Invalid cave name '{name}'[/]")
+        raise typer.Exit(1)
+    return d
 
 
 def resolve_cave(name: str | None) -> tuple[str, Path]:
@@ -476,7 +481,13 @@ def cp(
         raise typer.Exit(1)
 
     if src.startswith(":"):
-        # Container → host
+        # Container → host: resolve dst and confirm if outside cwd
+        dst_resolved = Path(dst).resolve()
+        cwd = Path.cwd().resolve()
+        if not str(dst_resolved).startswith(str(cwd) + "/") and dst_resolved != cwd:
+            if not typer.confirm(f"Write to '{dst_resolved}' (outside current directory)?", default=False):
+                console.print("Aborted")
+                return
         run(["docker", "cp", f"{container_id}:{src[1:]}", dst])
     else:
         # Host → container
@@ -572,6 +583,7 @@ def seed(
     repo_path: Annotated[str, typer.Argument(help="Path to source git repo")],
     name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
     branch: Annotated[Optional[str], typer.Option(help="Branch to seed (default: current branch)")] = None,
+    all_branches: Annotated[bool, typer.Option("--all", help="Seed all branches")] = False,
 ):
     """Seed a repo into the cave as a bare repo for secure git handoff."""
     name, d = resolve_cave(name)
@@ -604,14 +616,14 @@ def seed(
         raise typer.Exit(1)
 
     # Determine branch to push
-    if not branch:
+    if not all_branches and not branch:
         result = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
             cwd=repo, capture_output=True, text=True,
         )
         branch = result.stdout.strip()
         if not branch or branch == "HEAD":
-            err_console.print("[red]Detached HEAD — specify --branch[/]")
+            err_console.print("[red]Detached HEAD — specify --branch or --all[/]")
             raise typer.Exit(1)
 
     repo_name = repo.name
@@ -626,15 +638,43 @@ def seed(
     run(["git", "--git-dir", str(bare_path), "config",
          "jedicave.sourceRepo", str(repo)], check=False)
 
-    # Push branch
-    run(["git", "push", str(bare_path),
-         f"refs/heads/{branch}:refs/heads/{branch}"], cwd=repo)
+    # Push branches
+    if all_branches:
+        run(["git", "push", str(bare_path), "--all"], cwd=repo)
+        # Set HEAD to the current branch if possible
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=repo, capture_output=True, text=True,
+        )
+        head_branch = result.stdout.strip()
+        if head_branch and head_branch != "HEAD":
+            run(["git", "--git-dir", str(bare_path),
+                 "symbolic-ref", "HEAD", f"refs/heads/{head_branch}"])
+    else:
+        run(["git", "push", str(bare_path),
+             f"refs/heads/{branch}:refs/heads/{branch}"], cwd=repo)
+        # Set HEAD to the seeded branch
+        run(["git", "--git-dir", str(bare_path),
+             "symbolic-ref", "HEAD", f"refs/heads/{branch}"])
 
-    # Set HEAD to the seeded branch
-    run(["git", "--git-dir", str(bare_path),
-         "symbolic-ref", "HEAD", f"refs/heads/{branch}"])
+    # Record seeded commit count for harvest reporting
+    count_result = subprocess.run(
+        ["git", "--git-dir", str(bare_path), "rev-list", "--all", "--count"],
+        capture_output=True, text=True,
+    )
+    if count_result.returncode == 0:
+        run(["git", "--git-dir", str(bare_path), "config",
+             "jedicave.seededCount", count_result.stdout.strip()], check=False)
 
-    console.print(f"[green]Seeded '{repo_name}' branch '{branch}' into cave '{name}'[/]")
+    if all_branches:
+        branch_list = subprocess.run(
+            ["git", "--git-dir", str(bare_path), "branch"],
+            capture_output=True, text=True,
+        )
+        branch_count = len(branch_list.stdout.strip().splitlines()) if branch_list.stdout.strip() else 0
+        console.print(f"[green]Seeded '{repo_name}' ({branch_count} branches) into cave '{name}'[/]")
+    else:
+        console.print(f"[green]Seeded '{repo_name}' branch '{branch}' into cave '{name}'[/]")
     console.print(f"  Bare repo: {bare_path}")
     console.print(f"  Will be available at /workspace/{repo_name} inside the container")
 
@@ -642,20 +682,40 @@ def seed(
 @app.command()
 def unseed(
     repo_name: Annotated[str, typer.Argument(help="Repo name to remove")],
-    name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
+    name: Annotated[Optional[str], typer.Option("--cave", "-c", help="Cave name", autocompletion=complete_cave_name)] = None,
     yes: Annotated[bool, typer.Option("-y", "--yes", help="Skip confirmation")] = False,
 ):
     """Remove a seeded bare repo from the cave."""
     name, d = resolve_cave(name)
-    bare_path = d / "repos" / f"{repo_name}.git"
+    repos_dir = (d / "repos").resolve()
+    bare_path = (repos_dir / f"{repo_name}.git").resolve()
+
+    # Prevent path traversal (e.g. "../../something")
+    if not str(bare_path).startswith(str(repos_dir) + "/"):
+        err_console.print(f"[red]Invalid repo name '{repo_name}'[/]")
+        raise typer.Exit(1)
 
     if not bare_path.exists():
         err_console.print(f"[red]No seeded repo '{repo_name}' in cave '{name}'[/]")
         raise typer.Exit(1)
 
-    if yes or typer.confirm(f"Remove seeded repo '{repo_name}' from cave '{name}'?", default=False):
-        shutil.rmtree(bare_path)
-        console.print(f"[green]Removed '{repo_name}' from cave '{name}'[/]")
+    # Warn about unfetched agent commits
+    count_result = subprocess.run(
+        ["git", "--git-dir", str(bare_path), "rev-list", "--all", "--count"],
+        capture_output=True, text=True,
+    )
+    commit_count = count_result.stdout.strip() if count_result.returncode == 0 else "unknown"
+    console.print(f"  [yellow]Bare repo has {commit_count} commit(s). This may include unharvested agent work.[/]")
+
+    if yes or typer.confirm(f"Unseed repo '{repo_name}' from cave '{name}'?", default=False):
+        trash_dir = d / ".trash"
+        trash_dir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        trash_dest = trash_dir / f"{repo_name}.git.{timestamp}"
+        bare_path.rename(trash_dest)
+        console.print(f"[green]Unseeded '{repo_name}' from cave '{name}'[/]")
+        console.print(f"  Moved to: {trash_dest}")
+        console.print(f"  To restore: mv {trash_dest} {bare_path}")
     else:
         console.print("Aborted")
 
@@ -682,6 +742,24 @@ def harvest(
         return
 
     running = is_cave_running(d)
+
+    # Track pre-harvest branch tips per repo to identify new agent commits
+    pre_harvest_tips = {}  # repo_name -> set of commit hashes
+
+    def get_branch_tips(bare_path):
+        """Get all branch tip commit hashes from a bare repo."""
+        result = subprocess.run(
+            ["git", "--git-dir", str(bare_path), "rev-parse", "--branches"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return set(result.stdout.strip().splitlines())
+        return set()
+
+    # Snapshot current branch tips before sync
+    for bare in bare_repos:
+        rn = bare.name[:-4]
+        pre_harvest_tips[rn] = get_branch_tips(bare)
 
     # Sync agent commits from container into bare repos via bundle
     if running:
@@ -739,26 +817,71 @@ def harvest(
 
     for bare in bare_repos:
         repo_name = bare.name[:-4]
+        old_tips = pre_harvest_tips.get(repo_name, set())
 
-        # Get source repo path
-        source_result = subprocess.run(
-            ["git", "--git-dir", str(bare), "config", "jedicave.sourceRepo"],
+        # Build exclusion args: exclude commits reachable from pre-harvest tips
+        # This shows only commits added by the agent
+        exclude_args = [f"^{tip}" for tip in old_tips]
+
+        # Count new agent commits (not reachable from pre-harvest tips)
+        if old_tips:
+            count_result = subprocess.run(
+                ["git", "--git-dir", str(bare), "rev-list", "--all", "--count"] + exclude_args,
+                capture_output=True, text=True,
+            )
+            new_count = int(count_result.stdout.strip()) if count_result.returncode == 0 else 0
+
+            agent_result = subprocess.run(
+                ["git", "--git-dir", str(bare), "log", "--all",
+                 "--oneline", "--graph", "-30"] + exclude_args,
+                capture_output=True, text=True,
+            )
+            agent_log = agent_result.stdout.strip() if agent_result.returncode == 0 else ""
+        else:
+            new_count = 0
+            agent_log = ""
+
+        # Count total commits
+        total_result = subprocess.run(
+            ["git", "--git-dir", str(bare), "rev-list", "--all", "--count"],
             capture_output=True, text=True,
         )
-        source_repo = source_result.stdout.strip()
+        total_count = int(total_result.stdout.strip()) if total_result.returncode == 0 else 0
 
-        # Show branches and recent commits (including harvested refs)
-        result = subprocess.run(
-            ["git", "--git-dir", str(bare), "log", "--all",
-             "--oneline", "--graph", "-15"],
+        # Get seeded commit count (set during jedi seed)
+        seeded_result = subprocess.run(
+            ["git", "--git-dir", str(bare), "config", "jedicave.seededCount"],
             capture_output=True, text=True,
         )
+        seeded_count = int(seeded_result.stdout.strip()) if seeded_result.returncode == 0 and seeded_result.stdout.strip() else 0
+        agent_total = total_count - seeded_count
 
         console.print(f"\n[cyan]{repo_name}[/]")
-        if result.stdout.strip():
-            console.print(result.stdout.strip())
+
+        if new_count > 0:
+            summary = f"  [green]+{new_count} new[/]"
+            if agent_total > new_count:
+                summary += f" ({agent_total} by agent, {total_count} total)"
+            else:
+                summary += f" ({total_count} total)"
+            console.print(summary)
+            console.print(agent_log)
+        elif agent_total > 0:
+            console.print(f"  [dim]No new commits[/] ({agent_total} by agent, {total_count} total)")
+        elif old_tips:
+            console.print(f"  [dim]No new commits[/] ({total_count} total)")
         else:
-            console.print("  (no commits)")
+            # No pre-harvest tips means repo was empty before — all commits are agent's
+            result = subprocess.run(
+                ["git", "--git-dir", str(bare), "log", "--all",
+                 "--oneline", "--graph", "-30"],
+                capture_output=True, text=True,
+            )
+            if result.stdout.strip():
+                console.print(f"  [green]+{total_count} new[/]")
+                console.print(result.stdout.strip())
+            else:
+                console.print("  (no commits)")
 
     console.print(f"\n  To fetch into your repos:")
     console.print(f"    jedi fetch {name}")
@@ -1085,11 +1208,31 @@ def destroy(
     """Delete a cave."""
     name, d = resolve_cave(name)
 
+    # Check for repos with commits that may not have been fetched
+    repos_dir = d / "repos"
+    if repos_dir.exists():
+        bare_repos = [p for p in repos_dir.iterdir() if p.is_dir() and p.name.endswith(".git")]
+        if bare_repos:
+            console.print(f"  [yellow]Cave has {len(bare_repos)} seeded repo(s). Make sure you've fetched all agent work first.[/]")
+            for bare in bare_repos:
+                count = subprocess.run(
+                    ["git", "--git-dir", str(bare), "rev-list", "--all", "--count"],
+                    capture_output=True, text=True,
+                )
+                commits = count.stdout.strip() if count.returncode == 0 else "?"
+                console.print(f"    {bare.name[:-4]}: {commits} commit(s)")
+
     subprocess.run(["docker", "compose", "down"], cwd=d, capture_output=True)
 
-    if yes or typer.confirm(f"Delete cave '{name}' at {d}?", default=False):
-        shutil.rmtree(d)
+    if yes or typer.confirm(f"Destroy cave '{name}'?", default=False):
+        trash_dir = CAVES_DIR / ".trash"
+        trash_dir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        trash_dest = trash_dir / f"{name}.{timestamp}"
+        d.rename(trash_dest)
         console.print(f"[green]Cave '{name}' destroyed[/]")
+        console.print(f"  Moved to: {trash_dest}")
+        console.print(f"  To restore: mv {trash_dest} {d}")
     else:
         console.print("Aborted")
 
