@@ -113,15 +113,6 @@ packages.${system}.container = mkJediCave {
 };
 ```
 
-Create `~/.config/jedicaves/dagobah/compose.override.yml` for source mounts:
-
-```yaml
-services:
-  shell:
-    volumes:
-      - /home/yoda/code/foo:/workspace/foo
-```
-
 ### 4. Build
 
 ```bash
@@ -131,7 +122,20 @@ jedi build dagobah
 This runs `nix build` and loads the image into Docker. The resulting image
 contains all base tools **plus** everything from your project's devShell.
 
-### 5. Use
+### 5. Seed your repo
+
+```bash
+jedi seed /home/yoda/code/foo dagobah
+```
+
+This creates a **bare repo** in the cave at `repos/foo.git`, pushes your
+current branch into it, and mounts it into the container. On startup the
+container clones it into `/workspace/foo`.
+
+Why a bare repo instead of a direct bind mount? See
+[Git Handoff Lifecycle](#git-handoff-lifecycle) below.
+
+### 6. Use
 
 ```bash
 jedi shell dagobah     # Ephemeral — container removed on exit
@@ -147,12 +151,18 @@ jedi down dagobah      # Stop
 | `jedi init <name>` | Create a new cave | — |
 | `jedi build [name]` | Build cave image | — |
 | `jedi build --update [input]` | Update flake inputs then build | — |
+| `jedi seed <repo-path> [name]` | Seed a repo as a bare repo | — |
+| `jedi unseed <repo-name> [name]` | Remove a seeded repo | — |
+| `jedi harvest [name]` | Show agent commits, fetch instructions | — |
 | `jedi shell [name]` | Ephemeral cave, removed on exit | No |
 | `jedi up [name]` | Start cave in background | — |
 | `jedi enter [name]` | Enter a running cave | Yes |
 | `jedi exec [name] -- cmd` | Run command in running cave | Yes |
 | `jedi down [name]` | Stop cave | — |
 | `jedi list` | List all caves with status | — |
+| `jedi show [name]` | Cave overview (repos, volumes, status) | — |
+| `jedi dir [name]` | Print cave directory path | — |
+| `jedi logs [name]` | Show container logs | — |
 | `jedi firewall <on\|off\|status> [name]` | Manage network firewall | Yes |
 | `jedi destroy <name>` | Delete a cave | — |
 
@@ -165,8 +175,9 @@ When only one cave exists, the name can be omitted.
 ├── flake.nix                  ← imports holocronix + project
 ├── flake.lock
 ├── compose.yml                ← container runtime config
-├── compose.override.yml       ← project source mounts
-└── firewall-defaults.conf     ← domain allowlist
+├── firewall-defaults.conf     ← domain allowlist
+└── repos/
+    └── foo.git/               ← bare repo (seeded from host)
 ```
 
 ```
@@ -191,7 +202,7 @@ When only one cave exists, the name can be omitted.
 |-------|-----------------|--------|
 | **Base** | Claude Code, zsh, git, ripgrep, tmux, Python, Node.js, build tools, firewall | `lib/mkJediCave.nix` |
 | **Project** | Compiler, cross-toolchain, build deps from the project's devShell | Project's `flake.nix` |
-| **Runtime** | Source code (bind-mounted), persistent volumes for config/history | `compose.yml` |
+| **Runtime** | Source code (cloned from seeded bare repos), persistent volumes for config/history | `compose.yml` |
 
 ## Multiple Projects
 
@@ -272,6 +283,103 @@ To rebuild without updating (uses cached inputs):
 jedi build dagobah
 ```
 
+## Git Handoff Lifecycle
+
+Instead of bind-mounting your repo directly into the container, holocronix
+uses **bare repos** as a secure handoff mechanism. This prevents a rogue
+agent from tampering with your host's git hooks, config, or history.
+
+### The flow
+
+```
+  HOST                             CONTAINER
+  ────                             ─────────
+  ~/code/foo/                      /repos/foo.git (bare, mounted)
+       │                                │
+       │  jedi seed                     │
+       ├──────────────────────────►     │
+       │  (git push to bare repo)       │
+       │                                │
+       │                           git clone ──► /workspace/foo
+       │                                         (agent works here)
+       │                                              │
+       │                                         git commit
+       │                                              │
+       │  jedi harvest                                │
+       │◄─────────────────────────────────────────────┤
+       │  (git fetch from bare repo)                  │
+       │                                              │
+  review + merge                                      │
+       │                                              │
+  git push (to GitHub, etc.)
+```
+
+### Step by step
+
+**1. Seed** — push a branch from your repo into the cave:
+
+```bash
+jedi seed ~/code/foo dagobah                  # current branch
+jedi seed --branch feature ~/code/foo dagobah # specific branch
+```
+
+**2. Start the cave** — the entrypoint auto-clones into `/workspace/foo`:
+
+```bash
+jedi up dagobah
+```
+
+**3. Agent works** — commits go to the bare repo's object store.
+
+**4. Harvest** — see what the agent did:
+
+```bash
+jedi harvest dagobah
+```
+
+**5. Fetch into your repo** — review and merge:
+
+```bash
+cd ~/code/foo
+git fetch ~/.config/jedicaves/dagobah/repos/foo.git
+git log FETCH_HEAD
+git diff HEAD..FETCH_HEAD
+git merge FETCH_HEAD   # or cherry-pick, rebase, etc.
+```
+
+**6. Push** — once you're satisfied, push to your remote as usual:
+
+```bash
+git push origin main
+```
+
+### Why not bind-mount?
+
+A direct bind mount (`-v ~/code/foo:/workspace/foo`) exposes your `.git`
+directory. A rogue agent could:
+
+- Inject hooks (e.g. `post-checkout`) that execute on the host
+- Rewrite refs or history
+- Modify git config (aliases, remote URLs)
+
+The bare repo approach eliminates these vectors. The agent writes to an
+isolated object store, and you pull the results back with a review step.
+
+### Re-seeding
+
+To push updated code into the cave:
+
+```bash
+jedi seed ~/code/foo dagobah
+```
+
+To start fresh:
+
+```bash
+jedi unseed foo dagobah
+jedi seed ~/code/foo dagobah
+```
+
 ## Security Model
 
 **Sandboxed:** Filesystem (host files inaccessible except mounts), processes (isolated namespaces), packages (stay in container)
@@ -302,7 +410,7 @@ All packages and config are baked into the image at build time — no runtime do
 
 1. Check Docker is running: `systemctl status docker`
 2. Rebuild: `jedi build dagobah`
-3. Check logs: `docker logs $(docker ps -lq)`
+3. Check logs: `jedi logs dagobah`
 
 ### Path input not picking up changes
 

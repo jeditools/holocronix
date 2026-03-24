@@ -165,6 +165,7 @@ services:
     volumes:
       - {name}-history:/commandhistory
       - {name}-config:/env/.claude
+      - ./repos:/repos
       # Project source mounts go in compose.override.yml:
       #   services:
       #     shell:
@@ -192,6 +193,7 @@ def init(
         raise typer.Exit(1)
 
     d.mkdir(parents=True, exist_ok=True)
+    (d / "repos").mkdir(exist_ok=True)
 
     url = holocronix_url or os.environ.get("HOLOCRONIX_URL", HOLOCRONIX_URL_DEFAULT)
 
@@ -278,22 +280,23 @@ def update(
 @app.command()
 def build(
     name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
-    update: Annotated[Optional[str], typer.Option(
-        help="Update flake inputs before building (optionally specify one input)",
+    update: Annotated[Optional[list[str]], typer.Option(
+        help="Update inputs before building (specific inputs, or omit for all)",
         show_default=False,
     )] = None,
-    update_all: Annotated[bool, typer.Option("--update-all", help="Update all flake inputs before building")] = False,
 ):
     """Build cave image."""
     check_deps()
     name, d = resolve_cave(name)
 
-    if update_all:
-        console.print("Updating all inputs...")
-        run(["nix", "flake", "update"], cwd=d)
-    elif update:
-        console.print(f"Updating input [cyan]{update}[/]...")
-        run(["nix", "flake", "update", update], cwd=d)
+    if update is not None:
+        if update:
+            for inp in update:
+                console.print(f"Updating input [cyan]{inp}[/]...")
+                run(["nix", "flake", "update", inp], cwd=d)
+        else:
+            console.print("Updating all inputs...")
+            run(["nix", "flake", "update"], cwd=d)
 
     console.print(f"Building cave [cyan]{name}[/]...")
     run(["nix", "build", ".#container", "--print-build-logs"], cwd=d)
@@ -459,6 +462,241 @@ def firewall(
             console.print()
             run(["docker", "compose", "exec", "--user", "root", COMPOSE_SERVICE,
                  "iptables", "-L", "-n", "-v"], cwd=d)
+
+
+@app.command()
+def seed(
+    repo_path: Annotated[str, typer.Argument(help="Path to source git repo")],
+    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+    branch: Annotated[Optional[str], typer.Option(help="Branch to seed (default: current branch)")] = None,
+):
+    """Seed a repo into the cave as a bare repo for secure git handoff."""
+    name, d = resolve_cave(name)
+    repo = Path(repo_path).resolve()
+
+    # Ensure repos dir exists (for caves created before this feature)
+    (d / "repos").mkdir(exist_ok=True)
+
+    # Check compose setup
+    compose_file = d / "compose.yml"
+    if compose_file.exists() and "./repos:/repos" not in compose_file.read_text():
+        err_console.print(
+            "[yellow]compose.yml missing repos mount.[/] Add under services.shell.volumes:\n"
+            "      - ./repos:/repos"
+        )
+
+    # Check if there's a direct mount that should be removed
+    override_file = d / "compose.override.yml"
+    if override_file.exists():
+        target = f"/workspace/{repo.name}"
+        for line in override_file.read_text().splitlines():
+            if line.strip().startswith("- ") and target in line:
+                err_console.print(
+                    f"[yellow]compose.override.yml has a direct mount for {repo.name}.[/]\n"
+                    f"  Consider removing: {line.strip()[2:]}"
+                )
+
+    if not (repo / ".git").is_dir():
+        err_console.print(f"[red]{repo} is not a git repository[/]")
+        raise typer.Exit(1)
+
+    # Determine branch to push
+    if not branch:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=repo, capture_output=True, text=True,
+        )
+        branch = result.stdout.strip()
+        if not branch or branch == "HEAD":
+            err_console.print("[red]Detached HEAD — specify --branch[/]")
+            raise typer.Exit(1)
+
+    repo_name = repo.name
+    bare_path = d / "repos" / f"{repo_name}.git"
+
+    # Init bare repo if needed
+    if not (bare_path / "HEAD").exists():
+        bare_path.mkdir(parents=True, exist_ok=True)
+        run(["git", "init", "--bare", str(bare_path)])
+
+    # Store source repo path for harvest
+    run(["git", "--git-dir", str(bare_path), "config",
+         "jedicave.sourceRepo", str(repo)], check=False)
+
+    # Push branch
+    run(["git", "push", str(bare_path),
+         f"refs/heads/{branch}:refs/heads/{branch}"], cwd=repo)
+
+    # Set HEAD to the seeded branch
+    run(["git", "--git-dir", str(bare_path),
+         "symbolic-ref", "HEAD", f"refs/heads/{branch}"])
+
+    console.print(f"[green]Seeded '{repo_name}' branch '{branch}' into cave '{name}'[/]")
+    console.print(f"  Bare repo: {bare_path}")
+    console.print(f"  Will be available at /workspace/{repo_name} inside the container")
+
+
+@app.command()
+def unseed(
+    repo_name: Annotated[str, typer.Argument(help="Repo name to remove")],
+    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+    yes: Annotated[bool, typer.Option("-y", "--yes", help="Skip confirmation")] = False,
+):
+    """Remove a seeded bare repo from the cave."""
+    name, d = resolve_cave(name)
+    bare_path = d / "repos" / f"{repo_name}.git"
+
+    if not bare_path.exists():
+        err_console.print(f"[red]No seeded repo '{repo_name}' in cave '{name}'[/]")
+        raise typer.Exit(1)
+
+    if yes or typer.confirm(f"Remove seeded repo '{repo_name}' from cave '{name}'?", default=False):
+        shutil.rmtree(bare_path)
+        console.print(f"[green]Removed '{repo_name}' from cave '{name}'[/]")
+    else:
+        console.print("Aborted")
+
+
+@app.command()
+def harvest(
+    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+):
+    """Show agent commits in cave repos and how to fetch them."""
+    name, d = resolve_cave(name)
+    repos_dir = d / "repos"
+
+    if not repos_dir.exists():
+        console.print("No repos seeded. Run: jedi seed <repo-path>")
+        return
+
+    bare_repos = sorted(
+        p for p in repos_dir.iterdir()
+        if p.is_dir() and p.name.endswith(".git")
+    )
+
+    if not bare_repos:
+        console.print("No repos seeded. Run: jedi seed <repo-path>")
+        return
+
+    for bare in bare_repos:
+        repo_name = bare.name[:-4]
+
+        # Get source repo path
+        source_result = subprocess.run(
+            ["git", "--git-dir", str(bare), "config", "jedicave.sourceRepo"],
+            capture_output=True, text=True,
+        )
+        source_repo = source_result.stdout.strip()
+
+        # Show branches and recent commits
+        result = subprocess.run(
+            ["git", "--git-dir", str(bare), "log", "--all",
+             "--oneline", "--graph", "-15"],
+            capture_output=True, text=True,
+        )
+
+        console.print(f"\n[cyan]{repo_name}[/]")
+        if result.stdout.strip():
+            console.print(result.stdout.strip())
+        else:
+            console.print("  (no commits)")
+
+        console.print(f"\n  To fetch into your repo:")
+        if source_repo:
+            console.print(f"    cd {source_repo}")
+        else:
+            console.print(f"    cd /path/to/{repo_name}")
+        console.print(f"    git fetch {bare}")
+        console.print(f"    git log FETCH_HEAD")
+        console.print(f"    git diff HEAD..FETCH_HEAD")
+
+
+@app.command("dir")
+def dir_cmd(
+    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+):
+    """Print cave directory path."""
+    _name, d = resolve_cave(name)
+    print(d)
+
+
+@app.command()
+def show(
+    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+):
+    """Show cave overview."""
+    name, d = resolve_cave(name)
+
+    running = is_cave_running(d)
+    status = "[green]running[/]" if running else "[dim]stopped[/]"
+    console.print(f"[cyan]{name}[/]  {status}")
+    console.print(f"  Path: {d}")
+
+    # Repos
+    repos_dir = d / "repos"
+    if repos_dir.exists():
+        bare_repos = sorted(
+            p for p in repos_dir.iterdir()
+            if p.is_dir() and p.name.endswith(".git")
+        )
+        if bare_repos:
+            console.print(f"\n  Repos ({len(bare_repos)}):")
+            for bare in bare_repos:
+                repo_name = bare.name[:-4]
+                source_result = subprocess.run(
+                    ["git", "--git-dir", str(bare), "config", "jedicave.sourceRepo"],
+                    capture_output=True, text=True,
+                )
+                source = source_result.stdout.strip()
+                # Count commits
+                count_result = subprocess.run(
+                    ["git", "--git-dir", str(bare), "rev-list", "--all", "--count"],
+                    capture_output=True, text=True,
+                )
+                count = count_result.stdout.strip() or "0"
+                # Branches
+                branch_result = subprocess.run(
+                    ["git", "--git-dir", str(bare), "branch", "--format=%(refname:short)"],
+                    capture_output=True, text=True,
+                )
+                branches = branch_result.stdout.strip().splitlines()
+                branch_str = ", ".join(branches) if branches else "none"
+                console.print(f"    [cyan]{repo_name}[/]  {count} commits  [{branch_str}]")
+                if source:
+                    console.print(f"      source: {source}")
+
+    # Volumes from compose
+    compose_file = d / "compose.yml"
+    override_file = d / "compose.override.yml"
+    volume_lines = []
+    for f in [compose_file, override_file]:
+        if f.exists():
+            for line in f.read_text().splitlines():
+                stripped = line.strip()
+                if stripped.startswith("- ") and ":" in stripped and not stripped.startswith("- TZ"):
+                    volume_lines.append((f.name, stripped[2:]))
+
+    if volume_lines:
+        console.print(f"\n  Volumes:")
+        for source_file, vol in volume_lines:
+            label = f" [dim]({source_file})[/]" if source_file == "compose.override.yml" else ""
+            console.print(f"    {vol}{label}")
+
+
+@app.command()
+def logs(
+    name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
+    follow: Annotated[bool, typer.Option("-f", "--follow", help="Follow log output")] = False,
+    tail: Annotated[Optional[int], typer.Option("-n", "--tail", help="Number of lines from end")] = None,
+):
+    """Show cave container logs."""
+    name, d = resolve_cave(name)
+    cmd = ["docker", "compose", "--project-directory", str(d), "logs", COMPOSE_SERVICE]
+    if follow:
+        cmd.append("-f")
+    if tail is not None:
+        cmd.extend(["--tail", str(tail)])
+    os.execvp("docker", cmd)
 
 
 @app.command()
