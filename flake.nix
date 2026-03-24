@@ -43,8 +43,12 @@
         };
       };
 
+      defaults = builtins.fromJSON (builtins.readFile ./config/defaults.json);
+      defaultClaudeSettings = defaults.claudeSettings;
+      defaultPlugins = defaults.plugins;
+
       mkJediCave = import ./lib/mkJediCave.nix {
-        inherit pkgs claude-code defaultSkills;
+        inherit pkgs claude-code defaultSkills defaultClaudeSettings defaultPlugins;
       };
 
       # Resolve project devShell if the input provides one, otherwise empty.
@@ -59,7 +63,9 @@
 
     in {
       # ── Library ──────────────────────────────────────────────────────
-      lib.${system}.mkJediCave = mkJediCave;
+      lib.${system} = {
+        inherit mkJediCave defaultClaudeSettings defaultPlugins;
+      };
 
       # ── Packages ─────────────────────────────────────────────────────
       packages.${system} = {

@@ -1,0 +1,23 @@
+{
+  "claudeSettings": {
+    "permissions": {
+      "defaultMode": "bypassPermissions"
+    },
+    "hooks": {
+      "PreToolUse": [
+        {
+          "matcher": "Bash",
+          "hooks": [
+            {
+              "type": "command",
+              "command": "cmd=$(cat | jq -r .tool_input.command); if printf '%s' \"$cmd\" | grep -qiE '\\bgit\\s+push\\b|\\bgh\\s+'; then echo 'BLOCKED: git push and gh commands are not allowed in this container' >&2; exit 2; fi"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "plugins": [
+    "ralph-wiggum@claude-code-plugins"
+  ]
+}
