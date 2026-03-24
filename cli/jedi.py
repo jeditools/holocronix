@@ -2,6 +2,7 @@
 """jedi — CLI for managing jedicaves (sandboxed containers)."""
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -203,6 +204,65 @@ def cmd_init(args: argparse.Namespace) -> None:
     info(f"  3. Run: jedi build {name}")
 
 
+def cmd_inputs(args: argparse.Namespace) -> None:
+    check_deps()
+    name, d = resolve_cave(args.name)
+    result = subprocess.run(
+        ["nix", "flake", "metadata", "--json", "."],
+        cwd=d, capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        die(f"Failed to read flake metadata:\n{result.stderr.strip()}")
+
+    meta = json.loads(result.stdout)
+    locks = meta.get("locks", {}).get("nodes", {})
+    root_inputs = locks.get("root", {}).get("inputs", {})
+
+    if not root_inputs:
+        info(f"Cave '{name}' has no inputs")
+        return
+
+    info(f"Inputs for cave '{name}':")
+    for input_name, node_key in sorted(root_inputs.items()):
+        node = locks.get(node_key, {})
+        locked = node.get("locked", {})
+        rev = locked.get("rev", "")[:12]
+        url = locked.get("url", "")
+        ref = locked.get("ref", "")
+        input_type = locked.get("type", "")
+        if input_type == "path":
+            loc = locked.get("path", "")
+        elif url:
+            loc = url
+        else:
+            owner = locked.get("owner", "")
+            repo = locked.get("repo", "")
+            loc = f"{owner}/{repo}" if owner else ""
+        parts = [f"  {input_name:20s}"]
+        if loc:
+            parts.append(loc)
+        if ref:
+            parts.append(f"({ref})")
+        if rev:
+            parts.append(rev)
+        print(" ".join(parts))
+
+
+def cmd_update(args: argparse.Namespace) -> None:
+    check_deps()
+    name, d = resolve_cave(args.name)
+
+    if args.input:
+        info(f"Updating input '{args.input}'...")
+        result = run(["nix", "flake", "update", args.input], cwd=d, check=False)
+    else:
+        info("Updating all inputs...")
+        result = run(["nix", "flake", "update"], cwd=d, check=False)
+    if result.returncode != 0:
+        die("Failed to update flake inputs")
+    success(f"Lock updated for cave '{name}'")
+
+
 def cmd_build(args: argparse.Namespace) -> None:
     check_deps()
     name, d = resolve_cave(args.name)
@@ -368,6 +428,17 @@ def main() -> None:
     p.add_argument("--holocronix-url", default=None,
                    help=f"Holocronix flake URL (default: {HOLOCRONIX_URL_DEFAULT})")
     p.set_defaults(func=cmd_init)
+
+    # inputs
+    p = sub.add_parser("inputs", help="List flake inputs and their locked revisions")
+    p.add_argument("name", nargs="?", help="Cave name")
+    p.set_defaults(func=cmd_inputs)
+
+    # update
+    p = sub.add_parser("update", help="Update flake inputs (lock only)")
+    p.add_argument("input", nargs="?", help="Specific input to update (default: all)")
+    p.add_argument("name", nargs="?", help="Cave name")
+    p.set_defaults(func=cmd_update)
 
     # build
     p = sub.add_parser("build", help="Build cave image")
