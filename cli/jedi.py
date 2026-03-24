@@ -238,6 +238,12 @@ def init(
     console.print(f"  1. Edit {d / 'flake.nix'} — add your project inputs and devShells")
     console.print(f"  2. Seed your project: jedi seed <repo-path> {name}")
     console.print(f"  3. Run: jedi build {name}")
+    console.print()
+    console.print("Then:")
+    console.print(f"  jedi up {name}        Start the cave")
+    console.print(f"  jedi enter {name}     Enter the cave")
+    console.print(f"  jedi guide           Learn more about caves")
+    console.print(f"  jedi --help          See all commands")
 
 
 @app.command()
