@@ -661,14 +661,8 @@ def harvest(
         else:
             console.print("  (no commits)")
 
-        console.print(f"\n  To fetch into your repo:")
-        if source_repo:
-            console.print(f"    cd {source_repo}")
-        else:
-            console.print(f"    cd /path/to/{repo_name}")
-        console.print(f"    git fetch {bare}")
-        console.print(f"    git log HEAD..FETCH_HEAD")
-        console.print(f"    git diff HEAD..FETCH_HEAD")
+    console.print(f"\n  To fetch into your repos:")
+    console.print(f"    jedi fetch {name}")
 
     if running:
         console.print(f"\n[dim]Tip: use 'jedi diff' to see uncommitted changes still inside the container[/]")
@@ -741,6 +735,114 @@ def diff(
             console.print(f"\n  [yellow]Untracked files ({len(untracked)}):[/]")
             for f in untracked:
                 console.print(f"    {f}")
+
+
+@app.command()
+def fetch(
+    name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
+    repo_name: Annotated[Optional[str], typer.Option("--repo", "-r", help="Specific repo (default: all)")] = None,
+):
+    """Fetch agent commits from cave into your source repos."""
+    name, d = resolve_cave(name)
+    repos_dir = d / "repos"
+
+    if not repos_dir.exists():
+        console.print("No repos seeded. Run: jedi seed <repo-path>")
+        return
+
+    bare_repos = sorted(
+        p for p in repos_dir.iterdir()
+        if p.is_dir() and p.name.endswith(".git")
+    )
+
+    if not bare_repos:
+        console.print("No repos seeded. Run: jedi seed <repo-path>")
+        return
+
+    # If cave is running, sync first (same as harvest)
+    if is_cave_running(d):
+        container_id = subprocess.run(
+            ["docker", "compose", "ps", "-q", COMPOSE_SERVICE],
+            cwd=d, capture_output=True, text=True,
+        ).stdout.strip()
+
+        for bare in bare_repos:
+            rn = bare.name[:-4]
+            if repo_name and rn != repo_name:
+                continue
+            workdir = f"/workspace/{rn}"
+            bundle_path = f"/tmp/{rn}.bundle"
+
+            check = subprocess.run(
+                ["docker", "compose", "exec", COMPOSE_SERVICE, "test", "-d", workdir],
+                cwd=d, capture_output=True,
+            )
+            if check.returncode != 0:
+                continue
+
+            result = subprocess.run(
+                ["docker", "compose", "exec", "-w", workdir, COMPOSE_SERVICE,
+                 "git", "bundle", "create", bundle_path, "--all"],
+                cwd=d, capture_output=True, text=True,
+            )
+            if result.returncode != 0:
+                continue
+
+            host_bundle = d / "repos" / f"{rn}.bundle"
+            subprocess.run(
+                ["docker", "cp", f"{container_id}:{bundle_path}", str(host_bundle)],
+                capture_output=True, text=True,
+            )
+
+            subprocess.run(
+                ["git", "--git-dir", str(bare), "fetch", str(host_bundle),
+                 "+refs/heads/*:refs/heads/*"],
+                capture_output=True, text=True,
+            )
+            host_bundle.unlink(missing_ok=True)
+
+    for bare in bare_repos:
+        rn = bare.name[:-4]
+        if repo_name and rn != repo_name:
+            continue
+
+        source_result = subprocess.run(
+            ["git", "--git-dir", str(bare), "config", "jedicave.sourceRepo"],
+            capture_output=True, text=True,
+        )
+        source_repo = source_result.stdout.strip()
+
+        if not source_repo or not Path(source_repo).is_dir():
+            err_console.print(
+                f"[red]No source repo for '{rn}'.[/] "
+                f"Fetch manually:\n  git fetch {bare}"
+            )
+            continue
+
+        result = run(
+            ["git", "fetch", str(bare), "+refs/heads/*:refs/remotes/cave/*"],
+            cwd=Path(source_repo), check=False,
+        )
+        if result.returncode != 0:
+            err_console.print(f"[red]Failed to fetch '{rn}'[/]")
+            continue
+
+        # Show what's on cave/ branches
+        branch_result = subprocess.run(
+            ["git", "branch", "-r", "--list", "cave/*", "--format=%(refname:short)"],
+            cwd=source_repo, capture_output=True, text=True,
+        )
+        branches = branch_result.stdout.strip().splitlines()
+
+        console.print(f"\n[green]Fetched '{rn}'[/] into {source_repo}")
+        if branches:
+            console.print(f"  Remote branches:")
+            for b in branches:
+                console.print(f"    {b}")
+        console.print(f"\n  Review:")
+        console.print(f"    cd {source_repo}")
+        console.print(f"    git log --oneline --graph cave/ --not HEAD")
+        console.print(f"    git diff HEAD..cave/<branch>")
 
 
 @app.command("dir")
@@ -848,7 +950,8 @@ def guide():
         "\n"
         "[bold cyan]6. Check progress & harvest results[/]\n"
         "   jedi diff my-cave            # uncommitted changes inside container\n"
-        "   jedi harvest my-cave         # committed work + fetch commands\n"
+        "   jedi harvest my-cave         # committed work overview\n"
+        "   jedi fetch my-cave           # fetch agent commits into your repos\n"
         "\n"
         "[bold cyan]Other useful commands[/]\n"
         "   jedi list                  # list all caves\n"
