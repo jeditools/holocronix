@@ -23,7 +23,7 @@
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
       defaultAgents = {
-        inherit (llm-agents.packages.${system}) claude-code opencode qwen-code;
+        inherit (llm-agents.packages.${system}) claude-code hermes-agent opencode qwen-code;
       };
 
       defaultSkills = {
