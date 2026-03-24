@@ -165,7 +165,7 @@ services:
     volumes:
       - {name}-history:/commandhistory
       - {name}-config:/env/.claude
-      - ./repos:/repos
+      - ./repos:/repos:ro
       # Project source mounts go in compose.override.yml:
       #   services:
       #     shell:
@@ -482,7 +482,7 @@ def seed(
     if compose_file.exists() and "./repos:/repos" not in compose_file.read_text():
         err_console.print(
             "[yellow]compose.yml missing repos mount.[/] Add under services.shell.volumes:\n"
-            "      - ./repos:/repos"
+            "      - ./repos:/repos:ro"
         )
 
     # Check if there's a direct mount that should be removed
