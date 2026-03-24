@@ -584,6 +584,7 @@ def seed(
     name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
     branch: Annotated[Optional[str], typer.Option(help="Branch to seed (default: current branch)")] = None,
     all_branches: Annotated[bool, typer.Option("--all", help="Seed all branches")] = False,
+    force: Annotated[bool, typer.Option("--force", "-f", help="Force-push (overwrite diverged branches)")] = False,
 ):
     """Seed a repo into the cave as a bare repo for secure git handoff."""
     name, d = resolve_cave(name)
@@ -639,23 +640,31 @@ def seed(
          "jedicave.sourceRepo", str(repo)], check=False)
 
     # Push branches
-    if all_branches:
-        run(["git", "push", str(bare_path), "--all"], cwd=repo)
-        # Set HEAD to the current branch if possible
-        result = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=repo, capture_output=True, text=True,
-        )
-        head_branch = result.stdout.strip()
-        if head_branch and head_branch != "HEAD":
+    push_cmd = ["git", "push"] + (["--force"] if force else [])
+    try:
+        if all_branches:
+            run(push_cmd + [str(bare_path), "--all"], cwd=repo)
+            # Set HEAD to the current branch if possible
+            result = subprocess.run(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                cwd=repo, capture_output=True, text=True,
+            )
+            head_branch = result.stdout.strip()
+            if head_branch and head_branch != "HEAD":
+                run(["git", "--git-dir", str(bare_path),
+                     "symbolic-ref", "HEAD", f"refs/heads/{head_branch}"])
+        else:
+            run(push_cmd + [str(bare_path),
+                 f"refs/heads/{branch}:refs/heads/{branch}"], cwd=repo)
+            # Set HEAD to the seeded branch
             run(["git", "--git-dir", str(bare_path),
-                 "symbolic-ref", "HEAD", f"refs/heads/{head_branch}"])
-    else:
-        run(["git", "push", str(bare_path),
-             f"refs/heads/{branch}:refs/heads/{branch}"], cwd=repo)
-        # Set HEAD to the seeded branch
-        run(["git", "--git-dir", str(bare_path),
-             "symbolic-ref", "HEAD", f"refs/heads/{branch}"])
+                 "symbolic-ref", "HEAD", f"refs/heads/{branch}"])
+    except subprocess.CalledProcessError:
+        err_console.print(
+            "[red]Push rejected — the bare repo has diverged (e.g. from harvested agent commits).[/]\n"
+            "  Re-run with [bold]--force[/] to overwrite: [dim]jedi seed --force ...[/]"
+        )
+        raise typer.Exit(1)
 
     # Record seeded commit count for harvest reporting
     count_result = subprocess.run(
@@ -684,6 +693,7 @@ def reseed(
     repo_name: Annotated[Optional[str], typer.Argument(help="Repo name (default: all)")] = None,
     name: Annotated[Optional[str], typer.Option("--cave", "-c", help="Cave name", autocompletion=complete_cave_name)] = None,
     all_branches: Annotated[bool, typer.Option("--all", help="Push all branches")] = False,
+    force: Annotated[bool, typer.Option("--force", "-f", help="Force-push (overwrite diverged branches)")] = False,
 ):
     """Re-push host repo commits into seeded bare repos."""
     name, d = resolve_cave(name)
@@ -717,8 +727,9 @@ def reseed(
             err_console.print(f"[yellow]Skipping '{rn}': source repo not found at {source_repo}[/]")
             continue
 
+        push_cmd = ["git", "push"] + (["--force"] if force else [])
         if all_branches:
-            result = run(["git", "push", str(bare), "--all"],
+            result = run(push_cmd + [str(bare), "--all"],
                          cwd=Path(source_repo), check=False)
         else:
             # Push the current branch of the source repo
@@ -730,7 +741,7 @@ def reseed(
             if not branch or branch == "HEAD":
                 err_console.print(f"[yellow]Skipping '{rn}': detached HEAD, use --all[/]")
                 continue
-            result = run(["git", "push", str(bare),
+            result = run(push_cmd + [str(bare),
                           f"refs/heads/{branch}:refs/heads/{branch}"],
                          cwd=Path(source_repo), check=False)
 
@@ -745,7 +756,10 @@ def reseed(
                      "jedicave.seededCount", count_result.stdout.strip()], check=False)
             console.print(f"[green]Reseeded '{rn}'[/]")
         else:
-            err_console.print(f"[red]Failed to reseed '{rn}'[/]")
+            err_console.print(
+                f"[red]Failed to reseed '{rn}' — push rejected (branch may have diverged).[/]\n"
+                "  Re-run with [bold]--force[/] to overwrite: [dim]jedi reseed --force ...[/]"
+            )
 
 
 @app.command()
