@@ -311,7 +311,7 @@ def build(
 @app.command()
 def up(
     name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
-    firewall: Annotated[bool, typer.Option(help="Enable firewall on startup")] = False,
+    firewall: Annotated[bool, typer.Option(help="Enable firewall on startup")] = True,
 ):
     """Start cave container."""
     name, d = resolve_cave(name)
@@ -341,7 +341,7 @@ def down(
 @app.command()
 def shell(
     name: Annotated[Optional[str], typer.Argument(help="Cave name")] = None,
-    firewall: Annotated[bool, typer.Option(help="Enable firewall")] = False,
+    firewall: Annotated[bool, typer.Option(help="Enable firewall")] = True,
 ):
     """Ephemeral shell (no 'up' needed)."""
     name, d = resolve_cave(name)
