@@ -7,8 +7,12 @@
 { pkgs, defaultAgents ? {}, defaultSkills ? {}, defaultClaudeSettings ? {}, defaultPlugins ? [] }:
 
 {
-  # Project devShells to extract deps from (nativeBuildInputs + buildInputs).
-  # Pass one via projectShell, or many via projectShells.
+  # Project dev environments (attrset of workspace-name → devEnv from mkDevEnv).
+  # Each devEnv has: packages, env, setup, shell.
+  projects ? {},
+
+  # Legacy: project devShells to extract packages from.
+  # Use `projects` instead for full env + setup support.
   projectShell ? null,
   projectShells ? [],
 
@@ -47,13 +51,47 @@
 }:
 
 let
-  # Collect project devShells (singular for convenience, list for multi-project)
+  # ── Project environment ────────────────────────────────────────────────
+
+  # Legacy: collect packages from devShells
   allShells =
     (if projectShell != null then [ projectShell ] else []) ++ projectShells;
 
-  projectDeps = builtins.concatMap (shell:
+  shellDeps = builtins.concatMap (shell:
     (shell.nativeBuildInputs or []) ++ (shell.buildInputs or [])
   ) allShells;
+
+  # New: collect packages from projects
+  projectPackages = builtins.concatMap (p:
+    p.packages or []
+  ) (builtins.attrValues projects);
+
+  # Absolutize relative env values (starting with ".") per project
+  projectEnv = builtins.foldl' (acc: projName:
+    let
+      proj = projects.${projName};
+      envVars = proj.env or {};
+      absolutized = builtins.mapAttrs (_: v:
+        if builtins.substring 0 1 v == "."
+        then "/workspace/${projName}/${v}"
+        else v
+      ) envVars;
+    in acc // absolutized
+  ) {} (builtins.attrNames projects);
+
+  # Per-project setup commands (run after clone in entrypoint)
+  projectSetupScript = builtins.concatStringsSep "\n" (
+    builtins.filter (s: s != "") (
+      builtins.attrValues (builtins.mapAttrs (projName: proj:
+        if proj ? setup && proj.setup != null then ''
+    if [ -d "/workspace/${projName}" ]; then
+      echo "[jedicave] Setting up ${projName}..."
+      (cd /workspace/${projName} && ${proj.setup})
+    fi''
+        else ""
+      ) projects)
+    )
+  );
 
   agentPackages = builtins.attrValues agents;
 
@@ -72,7 +110,7 @@ let
 
     # Languages
     python315 uv nodejs_22
-  ] ++ agentPackages ++ projectDeps ++ extraPackages;
+  ] ++ agentPackages ++ shellDeps ++ projectPackages ++ extraPackages;
 
   env = pkgs.buildEnv {
     name = "jedicave-env";
@@ -167,6 +205,9 @@ let
       done
     fi
 
+    # Run project-specific setup (env, vendored deps, etc.)
+    ${projectSetupScript}
+
     exec sleep infinity
   '';
 
@@ -200,7 +241,7 @@ let
     NPM_CONFIG_MINIMUM_RELEASE_AGE = "1440";
   };
 
-  mergedEnv = defaultEnv // extraEnv;
+  mergedEnv = defaultEnv // projectEnv // extraEnv;
 
   envList = builtins.attrValues (builtins.mapAttrs (k: v: "${k}=${v}") mergedEnv);
 
