@@ -54,6 +54,8 @@
         inherit pkgs defaultAgents defaultSkills defaultClaudeSettings defaultPlugins;
       };
 
+      mkDevEnv = import ./lib/mkDevEnv.nix { inherit pkgs; };
+
       # Resolve project devShell if the input provides one, otherwise empty.
       projectShell =
         if project ? devShells
@@ -67,7 +69,7 @@
     in {
       # ── Library ──────────────────────────────────────────────────────
       lib.${system} = {
-        inherit mkJediCave defaultAgents defaultClaudeSettings defaultPlugins;
+        inherit mkJediCave mkDevEnv defaultAgents defaultClaudeSettings defaultPlugins;
       };
 
       # ── Packages ─────────────────────────────────────────────────────
