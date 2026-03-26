@@ -77,9 +77,9 @@ def complete_repo_name(incomplete: str) -> list[str]:
     if not caves:
         return []
     # Use active cave if set, otherwise first cave
-    active_file = CAVE_BASE / ".active"
+    active_file = CAVES_DIR / ".active"
     cave = active_file.read_text().strip() if active_file.exists() else caves[0]
-    repos_dir = CAVE_BASE / cave / "repos"
+    repos_dir = CAVES_DIR / cave / "repos"
     if not repos_dir.is_dir():
         return []
     return [
@@ -87,6 +87,28 @@ def complete_repo_name(incomplete: str) -> list[str]:
         for p in repos_dir.iterdir()
         if p.is_dir() and p.name.endswith(".git") and p.name[:-4].startswith(incomplete)
     ]
+
+
+def _set_compose_project_name(d: Path, project_name: str):
+    """Set COMPOSE_PROJECT_NAME in the cave's .env file."""
+    env_file = d / ".env"
+    lines = env_file.read_text().splitlines() if env_file.exists() else []
+    lines = [l for l in lines if not l.strip().startswith("COMPOSE_PROJECT_NAME=")]
+    lines.append(f"COMPOSE_PROJECT_NAME={project_name}")
+    env_file.write_text("\n".join(lines) + "\n")
+
+
+def _clear_compose_project_name(d: Path):
+    """Remove COMPOSE_PROJECT_NAME from the cave's .env file."""
+    env_file = d / ".env"
+    if not env_file.exists():
+        return
+    lines = env_file.read_text().splitlines()
+    lines = [l for l in lines if not l.strip().startswith("COMPOSE_PROJECT_NAME=")]
+    if any(l.strip() for l in lines):
+        env_file.write_text("\n".join(lines) + "\n")
+    else:
+        env_file.unlink()
 
 
 def run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
@@ -391,7 +413,53 @@ def down(
     name, d = resolve_cave(name)
     console.print(f"Stopping cave [cyan]{name}[/]...")
     run(["docker", "compose", "down"], cwd=d)
+    _clear_compose_project_name(d)
     console.print(f"[green]Cave '{name}' stopped[/]")
+
+
+@app.command()
+def rename(
+    old_name: Annotated[str, typer.Argument(help="Current cave name", autocompletion=complete_cave_name)],
+    new_name: Annotated[str, typer.Argument(help="New cave name")],
+):
+    """Rename a cave.
+
+    If the cave is running, containers keep running under the old
+    compose project name (stored in .env). Next down/up cycle switches
+    to the new name automatically.
+
+    Examples:
+        jedi rename myproject newname
+    """
+    _, old_dir = resolve_cave(old_name)
+    new_dir = cave_dir(new_name)
+
+    if new_dir.exists():
+        err_console.print(f"[red]Cave '{new_name}' already exists[/]")
+        raise typer.Exit(1)
+
+    running = is_cave_running(old_dir)
+
+    old_dir.rename(new_dir)
+
+    if running:
+        # Only set if not already overridden (handles chained renames)
+        env_file = new_dir / ".env"
+        has_override = env_file.exists() and any(
+            l.strip().startswith("COMPOSE_PROJECT_NAME=")
+            for l in env_file.read_text().splitlines()
+        )
+        if not has_override:
+            _set_compose_project_name(new_dir, old_name)
+
+    # Update active cave pointer
+    active_file = CAVES_DIR / ".active"
+    if active_file.exists() and active_file.read_text().strip() == old_name:
+        active_file.write_text(new_name + "\n")
+
+    console.print(f"[green]Renamed cave '{old_name}' → '{new_name}'[/]")
+    if running:
+        console.print(f"  Container still running (will switch on next down/up)")
 
 
 @app.command()
@@ -403,6 +471,7 @@ def restart(
     name, d = resolve_cave(name)
     console.print(f"Restarting cave [cyan]{name}[/]...")
     run(["docker", "compose", "down"], cwd=d)
+    _clear_compose_project_name(d)
     run(["docker", "compose", "up", "-d"], cwd=d)
     if firewall:
         fw_cmds = firewall_commands(d)
