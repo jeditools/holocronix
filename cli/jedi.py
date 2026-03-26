@@ -71,6 +71,24 @@ def complete_cave_name(incomplete: str) -> list[str]:
     return [name for name in _list_caves() if name.startswith(incomplete)]
 
 
+def complete_repo_name(incomplete: str) -> list[str]:
+    """Complete repo names from the active or first cave's repos dir."""
+    caves = _list_caves()
+    if not caves:
+        return []
+    # Use active cave if set, otherwise first cave
+    active_file = CAVE_BASE / ".active"
+    cave = active_file.read_text().strip() if active_file.exists() else caves[0]
+    repos_dir = CAVE_BASE / cave / "repos"
+    if not repos_dir.is_dir():
+        return []
+    return [
+        p.name[:-4]
+        for p in repos_dir.iterdir()
+        if p.is_dir() and p.name.endswith(".git") and p.name[:-4].startswith(incomplete)
+    ]
+
+
 def run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
     console.print(f"[dim]  {' '.join(cmd)}[/]")
     return subprocess.run(cmd, cwd=cwd, check=check)
@@ -682,12 +700,19 @@ def seed(
 
 @app.command()
 def reseed(
-    repo_name: Annotated[Optional[str], typer.Argument(help="Repo name (default: all)")] = None,
+    repo_name: Annotated[Optional[str], typer.Argument(help="Repo name (default: all)", autocompletion=complete_repo_name)] = None,
     name: Annotated[Optional[str], typer.Option("--cave", "-c", help="Cave name", autocompletion=complete_cave_name)] = None,
     all_branches: Annotated[bool, typer.Option("--all", help="Push all branches")] = False,
     force: Annotated[bool, typer.Option("--force", "-f", help="Force-push (overwrite diverged branches)")] = False,
 ):
-    """Re-push host repo commits into seeded bare repos."""
+    """Re-push host repo commits into seeded bare repos.
+
+    Examples:
+        jedi reseed myproject          Reseed a specific repo
+        jedi reseed                    Reseed all repos in the active cave
+        jedi reseed myproject --all    Reseed all branches
+        jedi reseed --cave dev -f      Force-reseed all repos in 'dev' cave
+    """
     name, d = resolve_cave(name)
     repos_dir = d / "repos"
 
