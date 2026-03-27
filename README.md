@@ -1,4 +1,5 @@
 # Holocronix
+<img width="1404" height="638" alt="image" src="https://github.com/user-attachments/assets/7754066d-6833-4d09-81b2-89da7f5d48dc" />
 
 > **⚠️ Active Development:** This project is under heavy development and
 > things change frequently. The best way to use `jedi` is to clone this
