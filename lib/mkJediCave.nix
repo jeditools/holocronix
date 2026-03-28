@@ -105,8 +105,8 @@ let
     # Build tools
     gcc gnumake binutils pkg-config systemdLibs
 
-    # Sandboxing / network
-    bubblewrap socat dnsutils iputils ipset iptables iproute2
+    # Monitoring / diagnostics (read-only, low-risk)
+    iputils procps
 
     # Languages
     python315 uv nodejs_22
@@ -117,6 +117,14 @@ let
     paths = jedicavePackages;
     pathsToLink = [ "/bin" "/lib" "/share" "/etc" "/include" ];
     ignoreCollisions = true;
+  };
+
+  # Infrastructure tools — installed to /usr/local/sbin (root-only).
+  # Not on the agent's PATH to prevent misuse by rogue agents.
+  infraEnv = pkgs.buildEnv {
+    name = "jedicave-infra-env";
+    paths = with pkgs; [ bubblewrap socat dnsutils iptables ipset iproute2 ];
+    pathsToLink = [ "/bin" "/sbin" ];
   };
 
   # ── Config files ─────────────────────────────────────────────────────
@@ -289,6 +297,14 @@ in pkgs.dockerTools.buildLayeredImage {
 
     # Ownership
     chown -R 1000:1000 ./home/yoda ./workspace ./commandhistory ./env
+
+    # Root-only infrastructure tools (not on agent PATH)
+    mkdir -p ./usr/local/sbin
+    for bin in ${infraEnv}/bin/* ${infraEnv}/sbin/*; do
+      [ -e "$bin" ] && ln -sf "$bin" "./usr/local/sbin/$(basename "$bin")"
+    done
+    chown 0:0 ./usr/local/sbin
+    chmod 0750 ./usr/local/sbin
 
     ${extraFakeRootCommands}
   '';
