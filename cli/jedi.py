@@ -135,12 +135,13 @@ def firewall_commands(d: Path) -> str:
         if line.strip() and not line.strip().startswith("#")
     ]
 
-    cmds = ["iptables -F OUTPUT"]
+    ipt = "/usr/local/sbin/iptables"
+    cmds = [f"{ipt} -F OUTPUT"]
     for domain in domains:
-        cmds.append(f"iptables -A OUTPUT -d {domain} -j ACCEPT")
-    cmds.append("iptables -A OUTPUT -o lo -j ACCEPT")
-    cmds.append("iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT")
-    cmds.append("iptables -A OUTPUT -j DROP")
+        cmds.append(f"{ipt} -A OUTPUT -d {domain} -j ACCEPT")
+    cmds.append(f"{ipt} -A OUTPUT -o lo -j ACCEPT")
+    cmds.append(f"{ipt} -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT")
+    cmds.append(f"{ipt} -A OUTPUT -j DROP")
     return " && ".join(cmds)
 
 
