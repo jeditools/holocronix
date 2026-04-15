@@ -100,7 +100,7 @@ let
 
   jedicavePackages = with pkgs; [
     # Core
-    coreutils bashInteractive zsh git cacert
+    coreutils bashInteractive zsh git cacert git-filter-repo
 
     # CLI tools
     fd ripgrep gnugrep fzf delta tmux ast-grep jq nano unzip vim curl oh-my-zsh gnused gawk less poppler-utils
