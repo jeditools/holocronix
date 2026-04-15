@@ -4,7 +4,7 @@
 # Returns a function that takes project-specific options and produces
 # a dockerTools.buildLayeredImage derivation.
 
-{ pkgs, defaultAgents ? {}, defaultSkills ? {}, defaultClaudeSettings ? {}, defaultPlugins ? [] }:
+{ pkgs, defaultAgents ? {}, defaultSkills ? {}, defaultClaudeSettings ? {}, defaultPlugins ? [], defaultPluginsSrc ? null }:
 
 {
   # Project dev environments (attrset of workspace-name → devEnv from mkDevEnv).
@@ -48,6 +48,9 @@
 
   # Additional plugins (extends the list above)
   extraPlugins ? [],
+
+  # Plugin marketplace source (path to claude-plugins-official checkout)
+  pluginsSrc ? defaultPluginsSrc,
 }:
 
 let
@@ -145,6 +148,64 @@ let
   knownMarketplaces = pkgs.writeText "known_marketplaces.json"
     (builtins.toJSON skillEntries);
 
+  # ── Pre-installed plugins ────────────────────────────────────────────
+  # Parse "name@marketplace" → { name, marketplace }
+  allPluginSpecs = plugins ++ extraPlugins;
+
+  parsePlugin = spec:
+    let parts = builtins.split "@" spec;
+    in { name = builtins.elemAt parts 0; marketplace = builtins.elemAt parts 2; };
+
+  # Find a plugin directory in the marketplace source
+  findPluginDir = name:
+    let
+      inPlugins = pluginsSrc + "/plugins/${name}";
+      inExternal = pluginsSrc + "/external_plugins/${name}";
+    in
+      if builtins.pathExists inPlugins then inPlugins
+      else if builtins.pathExists inExternal then inExternal
+      else throw "Plugin '${name}' not found in marketplace source";
+
+  # Read plugin version from .claude-plugin/plugin.json
+  pluginVersion = dir:
+    (builtins.fromJSON (builtins.readFile (dir + "/.claude-plugin/plugin.json"))).version;
+
+  # Resolved plugin info for each requested plugin
+  resolvedPlugins =
+    if pluginsSrc == null then []
+    else map (spec:
+      let
+        parsed = parsePlugin spec;
+        dir = findPluginDir parsed.name;
+      in {
+        inherit (parsed) name marketplace;
+        dir = dir;
+        version = pluginVersion dir;
+      }
+    ) allPluginSpecs;
+
+  # Generate installed_plugins.json
+  installedPluginsFile = pkgs.writeText "installed_plugins.json"
+    (builtins.toJSON {
+      version = 2;
+      plugins = builtins.listToAttrs (map (p: {
+        name = "${p.name}@${p.marketplace}";
+        value = [{
+          scope = "user";
+          installPath = "/env/.claude/plugins/cache/${p.marketplace}/${p.name}/${p.version}";
+          inherit (p) version;
+          installedAt = "2025-01-01T00:00:00.000Z";
+          lastUpdated = "2025-01-01T00:00:00.000Z";
+        }];
+      }) resolvedPlugins);
+    });
+
+  # Shell commands to copy plugin files into the image
+  pluginCopyCommands = builtins.concatStringsSep "\n" (map (p: ''
+    mkdir -p ./env/.claude/plugins/cache/${p.marketplace}/${p.name}/${p.version}
+    cp -r ${p.dir}/. ./env/.claude/plugins/cache/${p.marketplace}/${p.name}/${p.version}/
+  '') resolvedPlugins);
+
   gitconfigLocal = pkgs.writeText "gitconfig.local" ''
     [user]
         name = ${gitUser}
@@ -186,9 +247,6 @@ let
         cp ${knownMarketplaces} "$CLAUDE_CONFIG_DIR/plugins/known_marketplaces.json"
 
       chmod -R u+rw "$CLAUDE_CONFIG_DIR" 2>/dev/null || true
-
-      # Install plugins
-      ${builtins.concatStringsSep "\n      " (map (p: "claude plugin install ${p}") (plugins ++ extraPlugins))}
   '';
 
   entrypoint = pkgs.writeShellScriptBin "jedicave-start" ''
@@ -286,10 +344,19 @@ in pkgs.dockerTools.buildLayeredImage {
     cp ${configDir}/gitignore_global ./home/yoda/.gitignore_global
     cp ${gitconfigLocal}           ./home/yoda/.gitconfig.local
 
-    # Claude settings
+    # Claude settings + plugins
     ${if hasClaude then ''
     cp ${claudeSettingsFile}      ./env/.claude/settings.json
     cp ${knownMarketplaces}   ./env/.claude/plugins/known_marketplaces.json
+    '' else ""}
+    ${if hasClaude && pluginsSrc != null then ''
+    # Marketplace source (for /plugin browse)
+    mkdir -p ./env/.claude/plugins/marketplaces/claude-plugins-official
+    cp -r ${pluginsSrc}/. ./env/.claude/plugins/marketplaces/claude-plugins-official/
+
+    # Pre-installed plugins
+    ${pluginCopyCommands}
+    cp ${installedPluginsFile} ./env/.claude/plugins/installed_plugins.json
     '' else ""}
 
     # Shell history placeholders

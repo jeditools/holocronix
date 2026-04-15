@@ -50,8 +50,10 @@
       defaultClaudeSettings = defaults.claudeSettings;
       defaultPlugins = defaults.plugins;
 
+      defaultPluginsSrc = plugins-official;
+
       mkJediCave = import ./lib/mkJediCave.nix {
-        inherit pkgs defaultAgents defaultSkills defaultClaudeSettings defaultPlugins;
+        inherit pkgs defaultAgents defaultSkills defaultClaudeSettings defaultPlugins defaultPluginsSrc;
       };
 
       mkDevEnv = import ./lib/mkDevEnv.nix { inherit pkgs; };
@@ -69,7 +71,7 @@
     in {
       # ── Library ──────────────────────────────────────────────────────
       lib.${system} = {
-        inherit mkJediCave mkDevEnv defaultAgents defaultClaudeSettings defaultPlugins;
+        inherit mkJediCave mkDevEnv defaultAgents defaultClaudeSettings defaultPlugins defaultPluginsSrc;
       };
 
       # ── Packages ─────────────────────────────────────────────────────

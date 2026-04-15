@@ -18,6 +18,6 @@
     }
   },
   "plugins": [
-    "ralph-wiggum@claude-code-plugins"
+    "ralph-loop@claude-plugins-official"
   ]
 }
