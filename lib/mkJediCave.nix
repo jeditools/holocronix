@@ -259,6 +259,17 @@ let
       echo "[jedicave] Setup complete."
     fi
 
+    # L7 proxy CA: merge proxy CA cert with the system bundle so HTTPS
+    # interception works transparently for all tools (curl, git, pip, etc.)
+    if [ -f /proxy-ca/mitmproxy-ca-cert.pem ]; then
+      echo "[jedicave] Injecting proxy CA certificate..."
+      cat "$SSL_CERT_FILE" /proxy-ca/mitmproxy-ca-cert.pem > /tmp/ca-bundle.crt
+      export SSL_CERT_FILE=/tmp/ca-bundle.crt
+      export NIX_SSL_CERT_FILE=/tmp/ca-bundle.crt
+      export NODE_EXTRA_CA_CERTS=/proxy-ca/mitmproxy-ca-cert.pem
+      export REQUESTS_CA_BUNDLE=/tmp/ca-bundle.crt
+    fi
+
     # Clone bare repos from /repos/ into /workspace/
     if [ -d /repos ]; then
       for bare in /repos/*.git; do

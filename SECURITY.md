@@ -11,7 +11,7 @@ This document describes what the jedicave isolates, what it does not, and where 
 | Privileges | Hardened | No sudo, no setuid; firewall rules immutable from container user |
 | NPM scripts | Hardened | Disabled by default (`IGNORE_SCRIPTS=true`, 24h release age gate) |
 | Network | Firewalled by default | Egress restricted to allowlist; use `jedi firewall off` to open |
-| DNS | Open | Not filtered even with firewall; tunneling possible |
+| DNS | Configurable | `open` (default), `trusted` (redirect), or `synthetic` (CoreDNS allowlist) |
 | Kernel | Shared | Host kernel exposed; container escape via kernel vuln possible |
 | Resources | Unlimited | No CPU/memory/PID limits configured |
 | Git identity | Isolated | Host `~/.gitconfig` not mounted by default |
@@ -24,7 +24,7 @@ This document describes what the jedicave isolates, what it does not, and where 
 | Resource limits (cgroup) | Prevents fork bombs, memory exhaustion |
 | Seccomp profile | Reduces kernel attack surface |
 | Read-only root filesystem | Prevents persistent container modifications |
-| DNS filtering (CoreDNS) | Closes DNS tunneling, strengthens firewall |
+| DNS filtering (CoreDNS) | **Implemented** — `dns.mode: synthetic` in `policy.yaml` |
 | Cloud metadata blocking | Prevents IAM credential leaks on cloud hosts |
 | `no-new-privileges` | Blocks privilege escalation via setuid/execve |
 | User namespace remapping | Maps container root to unprivileged host UID |
@@ -52,7 +52,7 @@ The container shares the host Linux kernel. A kernel vulnerability exploitable f
 
 The firewall is enabled by default, restricting outbound access to allowlisted domains. It can be disabled with `jedi firewall off` or `--no-firewall`. Even with the firewall enabled:
 
-- **DNS is not blocked.** DNS queries still resolve for all domains. A malicious process could use DNS tunneling to exfiltrate data or receive commands. Blocking DNS entirely would break name resolution for allowlisted domains, so this is a trade-off.
+- **DNS tunneling (in `open` mode).** By default (`dns.mode: open` in `policy.yaml`), DNS queries resolve for all domains. A malicious process could use DNS tunneling to exfiltrate data. Set `dns.mode: synthetic` to run a CoreDNS sidecar that only resolves allowlisted domains (everything else returns NXDOMAIN), or `dns.mode: trusted` to redirect DNS to specific resolvers via iptables DNAT.
 - **Exfiltration via allowed domains.** Data can be exfiltrated through any allowlisted endpoint. For example, if `github.com` is allowed, a process could push data to an attacker-controlled repository.
 - **IP-based bypass.** The iptables rules use domain names, which are resolved to IPs at rule-creation time. If a domain resolves to multiple IPs or changes its DNS records after rules are applied, traffic may be allowed or blocked unexpectedly.
 - **Cloud metadata services.** On cloud instances (AWS, GCP, Azure), the instance metadata endpoint (`169.254.169.254`) is reachable from inside the container by default. This can leak IAM credentials, instance identity tokens, and other sensitive data. The default firewall rules do not block this endpoint.
@@ -151,7 +151,7 @@ Run the container with `read_only: true` and use tmpfs mounts for writable paths
 
 ### DNS filtering
 
-Replace plain DNS with a filtering DNS resolver (e.g., CoreDNS with a policy plugin) that only resolves allowlisted domains. This would close the DNS tunneling gap and make the firewall rules more robust than IP-based iptables matching.
+Set `network.dns.mode: synthetic` in `policy.yaml` to deploy a CoreDNS sidecar that only resolves allowlisted domains (returns NXDOMAIN for everything else). This closes the DNS tunneling gap. Alternatively, `dns.mode: trusted` redirects DNS to specified resolvers via iptables DNAT — lighter, but does not prevent tunneling.
 
 ### Cloud metadata blocking
 

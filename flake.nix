@@ -66,7 +66,7 @@
         then project.devShells.${system}.default
         else null;
 
-      jediPython = pkgs.python314.withPackages (ps: [ ps.typer ]);
+      jediPython = pkgs.python314.withPackages (ps: [ ps.typer ps.pyyaml ]);
 
     in {
       # ── Library ──────────────────────────────────────────────────────

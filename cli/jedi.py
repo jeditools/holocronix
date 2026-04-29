@@ -4,6 +4,7 @@
 import json
 import os
 import shutil
+import socket
 import subprocess
 from datetime import datetime
 from enum import Enum
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Annotated, Optional
 
 import typer
+import yaml
 from rich.console import Console
 from rich.table import Table
 
@@ -124,21 +126,140 @@ def is_cave_running(d: Path) -> bool:
     return bool(result.stdout.strip())
 
 
-def firewall_commands(d: Path) -> str:
-    config = d / "firewall-defaults.conf"
-    if not config.exists():
-        err_console.print(f"[red]No firewall config at {config}[/]")
-        raise typer.Exit(1)
+def _load_policy(d: Path) -> dict:
+    """Load a cave's policy.yaml, falling back to legacy firewall-defaults.conf."""
+    policy_file = d / "policy.yaml"
+    if policy_file.exists():
+        return yaml.safe_load(policy_file.read_text()) or {}
 
-    domains = [
-        line.strip() for line in config.read_text().splitlines()
-        if line.strip() and not line.strip().startswith("#")
-    ]
+    # Legacy fallback: synthesize a minimal policy from firewall-defaults.conf
+    legacy = d / "firewall-defaults.conf"
+    if legacy.exists():
+        domains = [
+            line.strip() for line in legacy.read_text().splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        return {
+            "network": {
+                "firewall": True,
+                "domains": domains,
+                "dns": {"mode": "open"},
+            },
+            "secrets": {},
+            "proxy": {"enabled": False},
+            "hooks": [],
+        }
+
+    err_console.print(f"[red]No policy at {policy_file} (or legacy firewall-defaults.conf)[/]")
+    raise typer.Exit(1)
+
+
+def _policy_domains(policy: dict) -> list[str]:
+    """Effective firewall allowlist: network.domains ∪ secrets[*].domains."""
+    network = policy.get("network") or {}
+    domains = list(network.get("domains") or [])
+    for secret in (policy.get("secrets") or {}).values():
+        for dom in secret.get("domains") or []:
+            if dom not in domains:
+                domains.append(dom)
+    return domains
+
+
+def _resolve_secrets(d: Path, policy: dict) -> Path | None:
+    """Resolve each secret's value_cmd on the host and write secrets.env.
+
+    Returns the path to secrets.env (for callers to know it exists), or None
+    if no secrets are defined. The file is written mode 0600.
+    """
+    secrets = policy.get("secrets") or {}
+    env_file = d / "secrets.env"
+
+    if not secrets:
+        if env_file.exists():
+            env_file.unlink()
+        return None
+
+    lines = []
+    for name, cfg in secrets.items():
+        inject = (cfg or {}).get("inject", "env")
+        cmd = (cfg or {}).get("value_cmd")
+        placeholder = (cfg or {}).get("placeholder", "{{" + name + "}}")
+
+        if inject == "proxy":
+            # Shell container gets only the placeholder; real value goes to the proxy.
+            lines.append(f"{name}={placeholder}")
+            continue
+
+        if not cmd:
+            err_console.print(f"[red]Secret '{name}' missing value_cmd[/]")
+            raise typer.Exit(1)
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if result.returncode != 0:
+            err_console.print(
+                f"[red]Secret '{name}' value_cmd failed:[/]\n{result.stderr.strip()}"
+            )
+            raise typer.Exit(1)
+        value = result.stdout.rstrip("\n")
+        lines.append(f"{name}={value}")
+
+    env_file.write_text("\n".join(lines) + "\n")
+    env_file.chmod(0o600)
+    return env_file
+
+
+def _clear_secrets(d: Path) -> None:
+    env_file = d / "secrets.env"
+    if env_file.exists():
+        env_file.unlink()
+
+
+def firewall_commands(d: Path) -> str:
+    policy = _load_policy(d)
+    domains = _policy_domains(policy)
+    network = policy.get("network") or {}
+    dns_cfg = network.get("dns") or {}
+    dns_mode = dns_cfg.get("mode", "open")
+    proxy_enabled = bool((policy.get("proxy") or {}).get("enabled", False))
 
     ipt = "/usr/local/sbin/iptables"
-    cmds = [f"{ipt} -F OUTPUT"]
+    cmds = [
+        # Flush the filter OUTPUT chain so re-applying is idempotent.
+        f"{ipt} -F OUTPUT",
+    ]
+
+    # Trusted DNS mode: redirect all DNS to the configured resolvers.
+    # Only flush nat OUTPUT here — Docker's DNS DNAT rules live there,
+    # so we must not touch it in normal mode.
+    if dns_mode == "trusted":
+        servers = dns_cfg.get("servers") or []
+        if not servers:
+            err_console.print("[red]dns.mode=trusted requires network.dns.servers[/]")
+            raise typer.Exit(1)
+        target = servers[0]
+        cmds.insert(0, f"{ipt} -t nat -F OUTPUT")
+        cmds.append(f"{ipt} -t nat -A OUTPUT -p udp --dport 53 -j DNAT --to-destination {target}:53")
+        cmds.append(f"{ipt} -t nat -A OUTPUT -p tcp --dport 53 -j DNAT --to-destination {target}:53")
+
+    if proxy_enabled:
+        # L7 proxy enforcement: allow traffic to the proxy, drop direct 80/443.
+        # Agent sets HTTP_PROXY/HTTPS_PROXY env vars; iptables ensures bypass
+        # is impossible even if the agent unsets them.
+        cmds.append(f"{ipt} -A OUTPUT -d {CAVE_NET_PROXY_IP} -j ACCEPT")
+        cmds.append(f"{ipt} -A OUTPUT -p tcp --dport 80 -j DROP")
+        cmds.append(f"{ipt} -A OUTPUT -p tcp --dport 443 -j DROP")
+
     for domain in domains:
-        cmds.append(f"{ipt} -A OUTPUT -d {domain} -j ACCEPT")
+        # Resolve hostnames to IPs on the host — iptables inside the
+        # container may not have working DNS at this point.
+        try:
+            addrs = set(
+                info[4][0] for info in socket.getaddrinfo(domain, None, socket.AF_INET)
+            )
+        except socket.gaierror:
+            err_console.print(f"[yellow]Warning: could not resolve '{domain}', using hostname[/]")
+            addrs = {domain}
+        for addr in sorted(addrs):
+            cmds.append(f"{ipt} -A OUTPUT -d {addr} -j ACCEPT")
     cmds.append(f"{ipt} -A OUTPUT -o lo -j ACCEPT")
     cmds.append(f"{ipt} -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT")
     cmds.append(f"{ipt} -A OUTPUT -j DROP")
@@ -216,19 +337,112 @@ FLAKE_TEMPLATE = """\
 }}
 """
 
-FIREWALL_DEFAULTS = """\
-# Default allowlisted domains for jedi firewall
-# One domain per line. Lines starting with # are comments.
-api.anthropic.com
-# github.com
-# raw.githubusercontent.com
-# registry.npmjs.org
-# pypi.org
-# files.pythonhosted.org
+POLICY_DEFAULTS = """\
+# jedicave policy — per-cave security configuration
+#
+# `jedi up` reads this file at start time.
+
+network:
+  # Enable the iptables egress allowlist.
+  firewall: true
+
+  # Domains allowed through the firewall.
+  domains:
+    - api.anthropic.com
+    # - github.com
+    # - raw.githubusercontent.com
+    # - registry.npmjs.org
+    # - pypi.org
+    # - files.pythonhosted.org
+
+  # DNS mode:
+  #   open       — no DNS filtering (allows DNS tunneling)
+  #   trusted    — redirect DNS to specified resolvers via iptables DNAT
+  #   synthetic  — CoreDNS sidecar; only allowlisted domains resolve
+  dns:
+    mode: open
+    # servers: [1.1.1.1, 1.0.0.1]  # required for trusted mode
+
+# Secrets resolved on the host and injected into the cave.
+# `value_cmd` runs on the host at `jedi up` time.
+#
+# inject modes:
+#   env    — passed as env var into the shell container
+#   proxy  — replaced by the L7 proxy only for matching domains (requires proxy.enabled)
+secrets: {}
+  # ANTHROPIC_API_KEY:
+  #   value_cmd: "cat ~/.config/anthropic/api_key"
+  #   inject: env
+  #   domains: [api.anthropic.com]
+  #
+  # GITHUB_TOKEN:
+  #   value_cmd: "pass show github/token"
+  #   inject: proxy
+  #   placeholder: "{{GITHUB_TOKEN}}"
+  #   domains: [api.github.com]
+  #   headers: [Authorization]
+
+# L7 egress proxy (mitmproxy sidecar). Enables HTTP-level allow/deny,
+# proxy-based secret injection, and request/response hooks.
+proxy:
+  enabled: false
+
+# Request/response hooks run in the proxy container.
+hooks: []
+  # - name: audit-log
+  #   on: [request, response]
+  #   type: log
+  #   config:
+  #     path: ./logs/audit.jsonl
 """
 
-COMPOSE_TEMPLATE = """\
-services:
+# Static IPs inside the per-cave bridge network. Stable so iptables and
+# DNS settings can refer to them without a name-resolution step.
+CAVE_NET_SUBNET = "172.30.0.0/24"
+CAVE_NET_DNS_IP = "172.30.0.2"
+CAVE_NET_PROXY_IP = "172.30.0.3"
+
+
+def _generate_compose(name: str, policy: dict) -> str:
+    """Render compose.yml content from a cave name + policy dict.
+
+    Conditionally adds a CoreDNS sidecar (synthetic DNS mode) and a
+    bridge network with static IPs. Layout matches the original
+    static template when DNS is `open` and proxy is disabled.
+    """
+    network = policy.get("network") or {}
+    dns_mode = (network.get("dns") or {}).get("mode", "open")
+    proxy_enabled = bool((policy.get("proxy") or {}).get("enabled", False))
+
+    needs_net = dns_mode == "synthetic" or proxy_enabled
+
+    parts = ["services:"]
+
+    # --- shell service ---
+    env_lines = ["      - TZ=${TZ:-UTC}"]
+    if proxy_enabled:
+        env_lines.append(f"      - HTTP_PROXY=http://{CAVE_NET_PROXY_IP}:8080")
+        env_lines.append(f"      - HTTPS_PROXY=http://{CAVE_NET_PROXY_IP}:8080")
+        env_lines.append("      - NO_PROXY=localhost,127.0.0.1")
+    env_block = "\n".join(env_lines)
+
+    vol_lines = [
+        f"      - {name}-history:/commandhistory",
+        f"      - {name}-config:/env/.claude",
+        "      - ./repos:/repos:ro",
+    ]
+    if proxy_enabled:
+        vol_lines.append("      - ./proxy-ca/mitmproxy-ca-cert.pem:/proxy-ca/mitmproxy-ca-cert.pem:ro")
+    vol_lines.extend([
+        "      # Project source mounts go in compose.override.yml:",
+        "      #   services:",
+        "      #     shell:",
+        "      #       volumes:",
+        "      #         - /home/yoda/code/my-project:/workspace/my-project",
+    ])
+    vol_block = "\n".join(vol_lines)
+
+    parts.append(f"""\
   shell:
     image: jedicave:latest
     init: true
@@ -239,21 +453,337 @@ services:
       - NET_RAW
     working_dir: /workspace
     environment:
-      - TZ=${{TZ:-UTC}}
+{env_block}
+    env_file:
+      - path: secrets.env
+        required: false
     volumes:
-      - {name}-history:/commandhistory
-      - {name}-config:/env/.claude
-      - ./repos:/repos:ro
-      # Project source mounts go in compose.override.yml:
-      #   services:
-      #     shell:
-      #       volumes:
-      #         - /home/yoda/code/my-project:/workspace/my-project
+{vol_block}""")
 
+    # depends_on
+    depends = []
+    if dns_mode == "synthetic":
+        depends.append("dns")
+    if proxy_enabled:
+        depends.append("proxy")
+    if depends:
+        parts.append("    depends_on:")
+        for dep in depends:
+            parts.append(f"      - {dep}")
+
+    if dns_mode == "synthetic":
+        parts.append(f"""\
+    dns:
+      - {CAVE_NET_DNS_IP}""")
+
+    if needs_net:
+        parts.append("""\
+    networks:
+      - cave-net""")
+
+    # --- dns sidecar (synthetic mode) ---
+    if dns_mode == "synthetic":
+        parts.append(f"""
+  dns:
+    image: coredns/coredns:1.12.0
+    command: ["-conf", "/etc/coredns/Corefile"]
+    volumes:
+      - ./Corefile:/etc/coredns/Corefile:ro
+    networks:
+      cave-net:
+        ipv4_address: {CAVE_NET_DNS_IP}""")
+
+    # --- proxy sidecar (L7 proxy) ---
+    if proxy_enabled:
+        proxy_vol_lines = [
+            "      - ./proxy-ca:/certs:ro",
+            "      - ./proxy-policy.py:/policy.py:ro",
+        ]
+        # Mount secrets.env into proxy for proxy-mode secret injection
+        proxy_vol_lines.append("      - ./proxy-secrets.env:/run/secrets/env:ro")
+        proxy_vols = "\n".join(proxy_vol_lines)
+        parts.append(f"""
+  proxy:
+    image: mitmproxy/mitmproxy:11
+    command: ["mitmdump", "-s", "/policy.py", "--listen-port", "8080", "--set", "confdir=/certs"]
+    volumes:
+{proxy_vols}
+    networks:
+      cave-net:
+        ipv4_address: {CAVE_NET_PROXY_IP}""")
+
+    # --- volumes ---
+    parts.append(f"""
 volumes:
   {name}-history:
-  {name}-config:
-"""
+  {name}-config:""")
+
+    # --- network ---
+    if needs_net:
+        parts.append(f"""
+networks:
+  cave-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: {CAVE_NET_SUBNET}""")
+
+    return "\n".join(parts) + "\n"
+
+
+def _generate_corefile(policy: dict) -> str:
+    """Render a CoreDNS Corefile from policy. Allowlisted domains forward
+    upstream; everything else returns NXDOMAIN."""
+    network = policy.get("network") or {}
+    dns_cfg = network.get("dns") or {}
+    upstream = dns_cfg.get("upstream") or ["8.8.8.8", "8.8.4.4"]
+    domains = _policy_domains(policy)
+
+    upstream_str = " ".join(upstream)
+    blocks = ["(forward_upstream) {", f"    forward . {upstream_str}", "}", ""]
+    for dom in domains:
+        blocks.append(f"{dom} {{")
+        blocks.append("    import forward_upstream")
+        blocks.append("}")
+        blocks.append("")
+    blocks.extend([
+        ". {",
+        "    template IN ANY . {",
+        "        rcode NXDOMAIN",
+        "    }",
+        "}",
+    ])
+    return "\n".join(blocks) + "\n"
+
+
+def _generate_proxy_policy(policy: dict) -> str:
+    """Render the mitmproxy addon script that enforces the domain allowlist,
+    injects proxy-mode secrets, and runs hooks."""
+    domains = _policy_domains(policy)
+    secrets = policy.get("secrets") or {}
+
+    # Build secret injection map: placeholder → {value_env_var, domains, headers}
+    # Real values are loaded at runtime from /run/secrets/env inside the proxy.
+    proxy_secrets = {}
+    for sname, cfg in secrets.items():
+        if (cfg or {}).get("inject") == "proxy":
+            placeholder = (cfg or {}).get("placeholder", "{{" + sname + "}}")
+            proxy_secrets[placeholder] = {
+                "env_var": sname,
+                "domains": set(cfg.get("domains") or []),
+                "headers": cfg.get("headers") or [],
+            }
+
+    # Build hooks
+    hooks = policy.get("hooks") or []
+
+    lines = [
+        '"""jedicave L7 policy — generated by jedi, do not edit."""',
+        "import os, json, datetime",
+        "from mitmproxy import http",
+        "",
+        f"ALLOWED = {set(domains)!r}",
+        "",
+    ]
+
+    # Secret injection config
+    lines.append("# Proxy-mode secrets: placeholder → injection config")
+    lines.append("SECRETS = {}")
+    lines.append("")
+    lines.append("def _load_secrets():")
+    lines.append('    env_path = "/run/secrets/env"')
+    lines.append("    if not os.path.exists(env_path):")
+    lines.append("        return")
+    lines.append("    vals = {}")
+    lines.append("    for line in open(env_path):")
+    lines.append("        line = line.strip()")
+    lines.append('        if "=" in line and not line.startswith("#"):')
+    lines.append('            k, v = line.split("=", 1)')
+    lines.append("            vals[k] = v")
+
+    for placeholder, cfg in proxy_secrets.items():
+        env_var = cfg["env_var"]
+        doms = cfg["domains"]
+        headers = cfg["headers"]
+        lines.append(f'    if "{env_var}" in vals:')
+        lines.append(f'        SECRETS["{placeholder}"] = {{')
+        lines.append(f'            "value": vals["{env_var}"],')
+        lines.append(f'            "domains": {doms!r},')
+        lines.append(f'            "headers": {headers!r},')
+        lines.append(f"        }}")
+    lines.append("")
+    lines.append("_load_secrets()")
+    lines.append("")
+
+    # Audit log hook setup
+    audit_hooks = [h for h in hooks if h.get("type") == "log"]
+    if audit_hooks:
+        lines.append("# Audit log file handles")
+        lines.append("_audit_files = {}")
+        for h in audit_hooks:
+            log_path = h.get("config", {}).get("path", "/var/log/audit.jsonl")
+            lines.append(f'_audit_files["{h["name"]}"] = open("{log_path}", "a")')
+        lines.append("")
+
+    # Addon class
+    lines.extend([
+        "class PolicyAddon:",
+        "    def request(self, flow: http.HTTPFlow):",
+        "        host = flow.request.pretty_host",
+        "        if host not in ALLOWED:",
+        '            flow.response = http.Response.make(403, b"Blocked by jedicave policy")',
+        "            return",
+        "",
+        "        # Proxy-mode secret injection",
+        "        for placeholder, cfg in SECRETS.items():",
+        '            if host in cfg["domains"]:',
+        '                if cfg["headers"]:',
+        '                    for h in cfg["headers"]:',
+        "                        if h in flow.request.headers:",
+        "                            flow.request.headers[h] = flow.request.headers[h].replace(",
+        '                                placeholder, cfg["value"])',
+        "                # Also replace in request body",
+        "                if flow.request.content:",
+        "                    flow.request.content = flow.request.content.replace(",
+        '                        placeholder.encode(), cfg["value"].encode())',
+        "",
+    ])
+
+    # Request hooks
+    for h in hooks:
+        if "request" in (h.get("on") or []):
+            if h["type"] == "log":
+                lines.extend([
+                    f'        # hook: {h["name"]}',
+                    f'        _audit_files["{h["name"]}"].write(json.dumps({{',
+                    '            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),',
+                    '            "type": "request",',
+                    '            "method": flow.request.method,',
+                    '            "url": flow.request.pretty_url,',
+                    '            "host": host,',
+                    '            "size": len(flow.request.content or b""),',
+                    '        }) + "\\n")',
+                    f'        _audit_files["{h["name"]}"].flush()',
+                    "",
+                ])
+            elif h["type"] == "block":
+                max_size = h.get("config", {}).get("max_body_size")
+                if max_size:
+                    lines.extend([
+                        f'        # hook: {h["name"]}',
+                        f"        if len(flow.request.content or b'') > {max_size}:",
+                        '            flow.response = http.Response.make(413, b"Request too large")',
+                        "            return",
+                        "",
+                    ])
+
+    lines.extend([
+        "    def response(self, flow: http.HTTPFlow):",
+        "        pass",
+    ])
+
+    # Response hooks
+    for h in hooks:
+        if "response" in (h.get("on") or []):
+            if h["type"] == "log":
+                lines.extend([
+                    f'        # hook: {h["name"]}',
+                    f'        _audit_files["{h["name"]}"].write(json.dumps({{',
+                    '            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),',
+                    '            "type": "response",',
+                    '            "method": flow.request.method,',
+                    '            "url": flow.request.pretty_url,',
+                    '            "status": flow.response.status_code,',
+                    '            "size": len(flow.response.content or b""),',
+                    '        }) + "\\n")',
+                    f'        _audit_files["{h["name"]}"].flush()',
+                ])
+
+    lines.extend([
+        "",
+        "addons = [PolicyAddon()]",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+def _generate_proxy_ca(d: Path) -> None:
+    """Generate a mitmproxy-compatible CA keypair in <cave>/proxy-ca/
+    if one doesn't already exist."""
+    ca_dir = d / "proxy-ca"
+    cert = ca_dir / "mitmproxy-ca-cert.pem"
+    key = ca_dir / "mitmproxy-ca.pem"
+
+    if cert.exists() and key.exists():
+        return
+
+    ca_dir.mkdir(parents=True, exist_ok=True)
+
+    # Generate self-signed CA via openssl (available on all hosts)
+    subprocess.run([
+        "openssl", "req", "-x509", "-new", "-nodes",
+        "-keyout", str(key),
+        "-out", str(cert),
+        "-days", "3650",
+        "-subj", "/CN=jedicave proxy CA",
+    ], check=True, capture_output=True)
+    key.chmod(0o600)
+
+
+def _resolve_proxy_secrets(d: Path, policy: dict) -> None:
+    """Resolve proxy-mode secrets and write proxy-secrets.env.
+
+    This file is mounted only into the proxy container, never the shell.
+    """
+    secrets = policy.get("secrets") or {}
+    env_file = d / "proxy-secrets.env"
+
+    proxy_secrets = {
+        name: cfg for name, cfg in secrets.items()
+        if (cfg or {}).get("inject") == "proxy"
+    }
+
+    if not proxy_secrets:
+        if env_file.exists():
+            env_file.unlink()
+        return
+
+    lines = []
+    for name, cfg in proxy_secrets.items():
+        cmd = (cfg or {}).get("value_cmd")
+        if not cmd:
+            err_console.print(f"[red]Proxy secret '{name}' missing value_cmd[/]")
+            raise typer.Exit(1)
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if result.returncode != 0:
+            err_console.print(
+                f"[red]Proxy secret '{name}' value_cmd failed:[/]\n{result.stderr.strip()}"
+            )
+            raise typer.Exit(1)
+        lines.append(f"{name}={result.stdout.rstrip(chr(10))}")
+
+    env_file.write_text("\n".join(lines) + "\n")
+    env_file.chmod(0o600)
+
+
+def _write_compose(d: Path, name: str, policy: dict) -> None:
+    """Regenerate compose.yml + supporting files for the current policy."""
+    (d / "compose.yml").write_text(_generate_compose(name, policy))
+
+    if ((policy.get("network") or {}).get("dns") or {}).get("mode") == "synthetic":
+        (d / "Corefile").write_text(_generate_corefile(policy))
+
+    if (policy.get("proxy") or {}).get("enabled", False):
+        _generate_proxy_ca(d)
+        (d / "proxy-policy.py").write_text(_generate_proxy_policy(policy))
+        _resolve_proxy_secrets(d, policy)
+        # Create logs dir for audit hooks
+        hooks = policy.get("hooks") or []
+        for h in hooks:
+            if h.get("type") == "log":
+                log_path = h.get("config", {}).get("path", "")
+                if log_path.startswith("./"):
+                    (d / log_path).parent.mkdir(parents=True, exist_ok=True)
 
 
 # --- Commands ---
@@ -276,8 +806,8 @@ def init(
     url = holocronix_url or os.environ.get("HOLOCRONIX_URL", HOLOCRONIX_URL_DEFAULT)
 
     (d / "flake.nix").write_text(FLAKE_TEMPLATE.format(name=name, holocronix_url=url))
-    (d / "compose.yml").write_text(COMPOSE_TEMPLATE.format(name=name))
-    (d / "firewall-defaults.conf").write_text(FIREWALL_DEFAULTS)
+    (d / "policy.yaml").write_text(POLICY_DEFAULTS)
+    _write_compose(d, name, _load_policy(d))
 
     console.print(f"[green]Cave '{name}' created at {d}[/]")
     console.print("Next steps:")
@@ -394,6 +924,12 @@ def up(
 ):
     """Start cave container."""
     name, d = resolve_cave(name)
+    policy = _load_policy(d)
+    _write_compose(d, name, policy)
+    env_file = _resolve_secrets(d, policy)
+    if env_file:
+        console.print(f"[dim]  resolved {len(policy.get('secrets') or {})} secrets → {env_file.name}[/]")
+
     console.print(f"Starting cave [cyan]{name}[/]...")
     run(["docker", "compose", "up", "-d"], cwd=d)
     if firewall:
@@ -415,6 +951,7 @@ def down(
     console.print(f"Stopping cave [cyan]{name}[/]...")
     run(["docker", "compose", "down"], cwd=d)
     _clear_compose_project_name(d)
+    _clear_secrets(d)
     console.print(f"[green]Cave '{name}' stopped[/]")
 
 
@@ -470,9 +1007,18 @@ def restart(
 ):
     """Restart cave container (down + up)."""
     name, d = resolve_cave(name)
+    policy = _load_policy(d)
+
     console.print(f"Restarting cave [cyan]{name}[/]...")
     run(["docker", "compose", "down"], cwd=d)
     _clear_compose_project_name(d)
+    _clear_secrets(d)
+
+    _write_compose(d, name, policy)
+    env_file = _resolve_secrets(d, policy)
+    if env_file:
+        console.print(f"[dim]  resolved {len(policy.get('secrets') or {})} secrets → {env_file.name}[/]")
+
     run(["docker", "compose", "up", "-d"], cwd=d)
     if firewall:
         fw_cmds = firewall_commands(d)
@@ -624,20 +1170,20 @@ def firewall(
         fw_cmds = firewall_commands(d)
         run(["docker", "compose", "exec", "--user", "root", COMPOSE_SERVICE,
              "bash", "-c", fw_cmds], cwd=d)
-        config = d / "firewall-defaults.conf"
-        domains = [l.strip() for l in config.read_text().splitlines()
-                   if l.strip() and not l.strip().startswith("#")]
+        domains = _policy_domains(_load_policy(d))
         console.print(f"[green]Firewall enabled ({len(domains)} domains allowlisted)[/]")
 
     elif action == FirewallAction.off:
+        ipt = "/usr/local/sbin/iptables"
         run(["docker", "compose", "exec", "--user", "root", COMPOSE_SERVICE,
-             "bash", "-c", "iptables -F && iptables -X && iptables -P OUTPUT ACCEPT"], cwd=d)
+             "bash", "-c",
+             f"{ipt} -F OUTPUT && {ipt} -P OUTPUT ACCEPT"], cwd=d)
         console.print("[green]Firewall disabled[/]")
 
     elif action == FirewallAction.status:
         result = subprocess.run(
             ["docker", "compose", "exec", "--user", "root", COMPOSE_SERVICE,
-             "iptables", "-L", "OUTPUT", "-n"],
+             "/usr/local/sbin/iptables", "-L", "OUTPUT", "-n"],
             cwd=d, capture_output=True, text=True
         )
         lines = result.stdout.strip().splitlines()
@@ -655,7 +1201,7 @@ def firewall(
         if verbose:
             console.print()
             run(["docker", "compose", "exec", "--user", "root", COMPOSE_SERVICE,
-                 "iptables", "-L", "-n", "-v"], cwd=d)
+                 "/usr/local/sbin/iptables", "-L", "-n", "-v"], cwd=d)
 
 
 @app.command()

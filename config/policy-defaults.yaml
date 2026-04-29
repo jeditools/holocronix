@@ -1,0 +1,60 @@
+# jedicave policy — per-cave security configuration
+#
+# This file declares the network, secret, proxy, and hook policy for a
+# single cave. `jedi up` reads it at start time.
+
+network:
+  # Enable the iptables egress allowlist (default: true).
+  firewall: true
+
+  # Domains allowed through the firewall.
+  # Each entry becomes an `iptables -A OUTPUT -d <domain> -j ACCEPT` rule.
+  domains:
+    - api.anthropic.com
+    # - github.com
+    # - raw.githubusercontent.com
+    # - registry.npmjs.org
+    # - pypi.org
+    # - files.pythonhosted.org
+
+  # DNS mode:
+  #   open       — no DNS filtering (current default, allows DNS tunneling)
+  #   trusted    — redirect DNS to specified resolvers via iptables DNAT
+  #   synthetic  — CoreDNS sidecar; only allowlisted domains resolve (NXDOMAIN otherwise)
+  dns:
+    mode: open
+    # servers: [1.1.1.1, 1.0.0.1]  # required for trusted mode
+
+# Secrets are resolved on the host (trusted) and injected into the cave.
+# Each `value_cmd` runs on the host at `jedi up` time.
+#
+# inject modes:
+#   env    — passed as env var into the shell container (Phase 1B)
+#   proxy  — replaced by the L7 proxy only for matching domains (Phase 3)
+secrets: {}
+  # ANTHROPIC_API_KEY:
+  #   value_cmd: "cat ~/.config/anthropic/api_key"
+  #   inject: env
+  #   domains: [api.anthropic.com]
+  #
+  # GITHUB_TOKEN:
+  #   value_cmd: "pass show github/token"
+  #   inject: proxy
+  #   placeholder: "{{GITHUB_TOKEN}}"
+  #   domains: [api.github.com]
+  #   headers: [Authorization]
+
+# L7 egress proxy (mitmproxy sidecar). Enables HTTP-level allow/deny,
+# proxy-based secret injection, and request/response hooks.
+proxy:
+  enabled: false
+
+# Request/response hooks run in the proxy container. Builtin types:
+#   log   — JSONL audit trail of all requests/responses
+#   block — block requests matching conditions
+hooks: []
+  # - name: audit-log
+  #   on: [request, response]
+  #   type: log
+  #   config:
+  #     path: ./logs/audit.jsonl
