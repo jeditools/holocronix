@@ -27,6 +27,7 @@ console = Console()
 err_console = Console(stderr=True)
 
 CAVES_DIR = Path(os.environ.get("JEDI_CAVES_DIR", Path.home() / ".config" / "jedicaves"))
+DATA_DIR = Path(os.environ.get("JEDI_DATA_DIR", Path(__file__).resolve().parent.parent / "config"))
 COMPOSE_SERVICE = "shell"
 HOLOCRONIX_URL_DEFAULT = "github:jeditools/holocronix"
 
@@ -451,6 +452,9 @@ def _generate_compose(name: str, policy: dict) -> str:
     cap_add:
       - NET_ADMIN
       - NET_RAW
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:seccomp.json
     working_dir: /workspace
     environment:
 {env_block}
@@ -769,6 +773,7 @@ def _resolve_proxy_secrets(d: Path, policy: dict) -> None:
 def _write_compose(d: Path, name: str, policy: dict) -> None:
     """Regenerate compose.yml + supporting files for the current policy."""
     (d / "compose.yml").write_text(_generate_compose(name, policy))
+    shutil.copy2(DATA_DIR / "seccomp.json", d / "seccomp.json")
 
     if ((policy.get("network") or {}).get("dns") or {}).get("mode") == "synthetic":
         (d / "Corefile").write_text(_generate_corefile(policy))

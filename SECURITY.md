@@ -12,21 +12,24 @@ This document describes what the jedicave isolates, what it does not, and where 
 | NPM scripts | Hardened | Disabled by default (`IGNORE_SCRIPTS=true`, 24h release age gate) |
 | Network | Firewalled by default | Egress restricted to allowlist; use `jedi firewall off` to open |
 | DNS | Configurable | `open` (default), `trusted` (redirect), or `synthetic` (CoreDNS allowlist) |
-| Kernel | Shared | Host kernel exposed; container escape via kernel vuln possible |
+| Kernel | Shared | Host kernel exposed; seccomp blocks AF_ALG (CVE-2026-31431) |
 | Resources | Unlimited | No CPU/memory/PID limits configured |
 | Git identity | Isolated | Host `~/.gitconfig` not mounted by default |
 | Docker socket | Safe by default | Not mounted, but fatal if added |
 | Cloud metadata | Exposed | `169.254.169.254` reachable from container |
 | Volumes | Persistent | Survive rebuilds; no integrity verification |
 
+| Implemented hardening | Impact |
+|------------------------|--------|
+| Seccomp profile | Blocks AF_ALG and other unnecessary syscalls (CVE-2026-31431) |
+| `no-new-privileges` | Blocks privilege escalation via setuid/execve |
+| DNS filtering (CoreDNS) | `dns.mode: synthetic` in `policy.yaml` |
+
 | Future hardening | Impact |
 |------------------|--------|
 | Resource limits (cgroup) | Prevents fork bombs, memory exhaustion |
-| Seccomp profile | Reduces kernel attack surface |
 | Read-only root filesystem | Prevents persistent container modifications |
-| DNS filtering (CoreDNS) | **Implemented** — `dns.mode: synthetic` in `policy.yaml` |
 | Cloud metadata blocking | Prevents IAM credential leaks on cloud hosts |
-| `no-new-privileges` | Blocks privilege escalation via setuid/execve |
 | User namespace remapping | Maps container root to unprivileged host UID |
 | gVisor / Kata Containers | Kernel-level isolation without full VMs |
 | Volume integrity checks | Detects tampering between sessions |
@@ -47,6 +50,10 @@ This document describes what the jedicave isolates, what it does not, and where 
 ### Shared kernel
 
 The container shares the host Linux kernel. A kernel vulnerability exploitable from within the container could compromise the host. This is the fundamental limitation of OS-level containerization versus hardware virtualization (VMs).
+
+A custom seccomp profile (`seccomp.json`) reduces the kernel attack surface by blocking syscalls unnecessary for coding agent workloads. Notably, `AF_ALG` socket creation is denied (returns `EAFNOSUPPORT`), mitigating CVE-2026-31431 — a container escape via the kernel crypto API that requires only an unprivileged user. The profile is based on Docker's default with targeted additions. See https://copy.fail/ for details on the vulnerability.
+
+The `no-new-privileges` security option is also applied, preventing processes from gaining additional privileges via setuid binaries or `execve`.
 
 ### Network
 
@@ -118,11 +125,27 @@ The **container is the trust boundary**. Everything inside it — workspace file
 
 ### What the container does NOT defend against
 
-- **Container escapes.** A kernel exploit or Docker runtime vulnerability can break out of the namespace boundary. This requires a separate kernel (VM) to mitigate.
+- **Container escapes.** A kernel exploit or Docker runtime vulnerability can break out of the namespace boundary. The seccomp profile reduces the kernel attack surface (e.g., blocking AF_ALG for CVE-2026-31431), but full mitigation requires a separate kernel (VM) via gVisor or Kata Containers.
 - **Compromising the trusted tool chain.** If the Nix cache, Claude's install script, or Oh My Zsh is compromised at build/setup time, the container starts in a compromised state.
 - **Persistent volume poisoning.** Malicious code can write to named volumes (Claude config, shell history) that survive rebuilds, establishing persistence across sessions.
 - **Data exfiltration via allowed channels.** Even with the firewall enabled, data can leave through DNS, allowed domains, or timing side-channels. The container reduces the surface but cannot eliminate covert channels.
 - **Host resource exhaustion.** Without cgroup limits, a process inside the container can starve the host of CPU, memory, or disk.
+
+## Implemented hardening
+
+### Seccomp profile
+
+A custom seccomp profile is applied via `security_opt: [seccomp:seccomp.json]` in compose. The profile is based on Docker's default (which blocks ~44 syscalls) and adds:
+
+- **AF_ALG block (CVE-2026-31431).** `socket(AF_ALG, ...)` returns `EAFNOSUPPORT` (errno 97). AF_ALG exposes the kernel crypto API to userspace via `algif_aead`, which contains a logic flaw allowing a four-byte page-cache write from an unprivileged user. The 732-byte PoC works identically across all affected distributions (kernels shipped 2017-2026). Blocking AF_ALG has zero functional impact: TLS, SSH, dm-crypt, IPsec, and standard crypto libraries access the kernel crypto API directly, not through AF_ALG sockets.
+
+Future consideration: restrict socket families to an allowlist (`AF_UNIX`, `AF_INET`, `AF_INET6`, `AF_NETLINK`) rather than a denylist. More aggressive but more resilient to future socket-family kernel bugs.
+
+The profile source is `config/seccomp.json`, installed alongside the CLI via Nix and copied into each cave directory at `jedi init` / `jedi up` time.
+
+### No-new-privileges
+
+Applied via `security_opt: [no-new-privileges:true]` in compose. Prevents processes from gaining additional privileges via setuid binaries, `execve`, or other mechanisms. Combined with Nix stripping setuid bits, this ensures no privilege escalation path exists within the container.
 
 ## Future hardening
 
@@ -141,10 +164,6 @@ deploy:
       pids: 4096
 ```
 
-### Seccomp profile
-
-Apply a custom seccomp profile that restricts unnecessary syscalls. Docker's default seccomp profile blocks ~44 syscalls, but a tighter profile tailored to this workload could reduce the kernel attack surface further.
-
 ### Read-only root filesystem
 
 Run the container with `read_only: true` and use tmpfs mounts for writable paths (`/tmp`, `/run`). This prevents persistent modifications to the container image layer.
@@ -160,10 +179,6 @@ Add an iptables rule to block access to `169.254.169.254` (and its IPv6 equivale
 ```bash
 iptables -A OUTPUT -d 169.254.169.254 -j DROP
 ```
-
-### No-new-privileges
-
-Add `security_opt: [no-new-privileges:true]` to prevent processes from gaining additional privileges via setuid binaries, `execve`, or other mechanisms.
 
 ### User namespace remapping
 

@@ -22,6 +22,7 @@
     let
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
+      lib = pkgs.lib;
       defaultAgents = {
         inherit (llm-agents.packages.${system}) claude-code opencode qwen-code;
         # hermes-agent excluded — depends on litellm (supply chain compromise, 2026-03)
@@ -85,13 +86,20 @@
         jedi = pkgs.stdenvNoCC.mkDerivation {
           pname = "jedi";
           version = "0.1.0";
-          src = ./cli;
+          src = lib.cleanSourceWith {
+            src = ./.;
+            filter = path: _type:
+              let rel = lib.removePrefix (toString ./. + "/") (toString path);
+              in lib.hasPrefix "cli" rel || rel == "config" || rel == "config/seccomp.json";
+          };
           nativeBuildInputs = [ pkgs.makeWrapper ];
           installPhase = ''
-            mkdir -p $out/bin
-            install -m 755 $src/jedi.py $out/bin/jedi
+            mkdir -p $out/bin $out/share/jedi
+            install -m 755 $src/cli/jedi.py $out/bin/jedi
+            install -m 644 $src/config/seccomp.json $out/share/jedi/seccomp.json
             wrapProgram $out/bin/jedi \
-              --prefix PATH : ${pkgs.lib.makeBinPath [ jediPython ]}
+              --prefix PATH : ${pkgs.lib.makeBinPath [ jediPython ]} \
+              --set JEDI_DATA_DIR $out/share/jedi
           '';
         };
       };
