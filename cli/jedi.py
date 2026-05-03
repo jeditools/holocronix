@@ -773,7 +773,9 @@ def _resolve_proxy_secrets(d: Path, policy: dict) -> None:
 def _write_compose(d: Path, name: str, policy: dict) -> None:
     """Regenerate compose.yml + supporting files for the current policy."""
     (d / "compose.yml").write_text(_generate_compose(name, policy))
-    shutil.copy2(DATA_DIR / "seccomp.json", d / "seccomp.json")
+    dst_seccomp = d / "seccomp.json"
+    dst_seccomp.unlink(missing_ok=True)
+    shutil.copy2(DATA_DIR / "seccomp.json", dst_seccomp)
 
     if ((policy.get("network") or {}).get("dns") or {}).get("mode") == "synthetic":
         (d / "Corefile").write_text(_generate_corefile(policy))
