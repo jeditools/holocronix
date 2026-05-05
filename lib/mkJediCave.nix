@@ -106,7 +106,7 @@ let
     fd ripgrep gnugrep fzf delta tmux ast-grep jq nano unzip vim curl oh-my-zsh gnused gawk less poppler-utils
 
     # Build tools
-    gcc gnumake binutils pkg-config systemdLibs
+    gcc gnumake binutils pkg-config systemdLibs systemd.dev
 
     # Monitoring / diagnostics (read-only, low-risk)
     iputils procps
@@ -292,6 +292,7 @@ let
 
   defaultEnv = {
     PATH = "${env}/bin";
+    PKG_CONFIG_PATH = "${env}/lib/pkgconfig";
     SHELL = "${pkgs.zsh}/bin/zsh";
     USER = "yoda";
     HOME = "/home/yoda";
