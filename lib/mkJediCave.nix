@@ -132,21 +132,32 @@ let
 
   # ── Config files ─────────────────────────────────────────────────────
 
-  claudeSettingsFile = pkgs.writeText "claude-settings.json"
-    (builtins.toJSON claudeSettings);
+  # Merge auto-enabled pre-installed plugins into the user's settings.
+  finalClaudeSettings = claudeSettings // {
+    enabledPlugins = (claudeSettings.enabledPlugins or {}) // enabledPluginsFromList;
+  };
 
-  # Build skills marketplace entries from the attrset
-  # Each skill has { repo, path } where repo is "owner/repo" for GitHub skills
+  claudeSettingsFile = pkgs.writeText "claude-settings.json"
+    (builtins.toJSON finalClaudeSettings);
+
+  # known_marketplaces.json — registers each marketplace by name. The `source`
+  # is a placeholder: when CLAUDE_CODE_PLUGIN_SEED_DIR is set, Claude Code
+  # locates marketplace content by probing seed/marketplaces/<name>/ at
+  # runtime and ignores the source URL.
   skillEntries = builtins.mapAttrs (_name: skill: {
     source = { source = "github"; repo = skill.repo; };
-    installLocation = "${skill.path}";
-    lastUpdated = "2025-01-01T00:00:00.000Z";
   }) skills;
-
-  skillPaths = builtins.attrValues (builtins.mapAttrs (_: s: s.path) skills);
 
   knownMarketplaces = pkgs.writeText "known_marketplaces.json"
     (builtins.toJSON skillEntries);
+
+  # Copy each marketplace's source into the seed at marketplaces/<name>/.
+  marketplaceCopyCommands = builtins.concatStringsSep "\n" (
+    builtins.attrValues (builtins.mapAttrs (mname: skill: ''
+      mkdir -p ./env/.claude-plugin-seed/marketplaces/${mname}
+      cp -r ${skill.path}/. ./env/.claude-plugin-seed/marketplaces/${mname}/
+    '') skills)
+  );
 
   # ── Pre-installed plugins ────────────────────────────────────────────
   # Parse "name@marketplace" → { name, marketplace }
@@ -184,26 +195,17 @@ let
       }
     ) allPluginSpecs;
 
-  # Generate installed_plugins.json
-  installedPluginsFile = pkgs.writeText "installed_plugins.json"
-    (builtins.toJSON {
-      version = 2;
-      plugins = builtins.listToAttrs (map (p: {
-        name = "${p.name}@${p.marketplace}";
-        value = [{
-          scope = "user";
-          installPath = "/env/.claude/plugins/cache/${p.marketplace}/${p.name}/${p.version}";
-          inherit (p) version;
-          installedAt = "2025-01-01T00:00:00.000Z";
-          lastUpdated = "2025-01-01T00:00:00.000Z";
-        }];
-      }) resolvedPlugins);
-    });
+  # Auto-enable every pre-installed plugin.
+  enabledPluginsFromList = builtins.listToAttrs (map (spec: {
+    name = spec;
+    value = true;
+  }) allPluginSpecs);
 
-  # Shell commands to copy plugin files into the image
+  # Copy plugin contents into the seed at cache/<marketplace>/<plugin>/<version>/.
+  # Claude Code probes this path at runtime and uses the cached copy without re-cloning.
   pluginCopyCommands = builtins.concatStringsSep "\n" (map (p: ''
-    mkdir -p ./env/.claude/plugins/cache/${p.marketplace}/${p.name}/${p.version}
-    cp -r ${p.dir}/. ./env/.claude/plugins/cache/${p.marketplace}/${p.name}/${p.version}/
+    mkdir -p ./env/.claude-plugin-seed/cache/${p.marketplace}/${p.name}/${p.version}
+    cp -r ${p.dir}/. ./env/.claude-plugin-seed/cache/${p.marketplace}/${p.name}/${p.version}/
   '') resolvedPlugins);
 
   gitconfigLocal = pkgs.writeText "gitconfig.local" ''
@@ -237,14 +239,13 @@ let
   hasClaude = agents ? claude-code;
 
   claudeSetup = ''
-      # Claude Code config (CLAUDE_CONFIG_DIR is typically a Docker volume)
-      mkdir -p "$CLAUDE_CONFIG_DIR/plugins"
+      # Claude Code config (CLAUDE_CONFIG_DIR is typically a Docker volume).
+      # Marketplaces and plugins are baked into CLAUDE_CODE_PLUGIN_SEED_DIR
+      # and registered automatically — only settings.json needs seeding here.
+      mkdir -p "$CLAUDE_CONFIG_DIR"
 
       [ -f "$CLAUDE_CONFIG_DIR/settings.json" ] || \
         cp ${claudeSettingsFile} "$CLAUDE_CONFIG_DIR/settings.json"
-
-      [ -f "$CLAUDE_CONFIG_DIR/plugins/known_marketplaces.json" ] || \
-        cp ${knownMarketplaces} "$CLAUDE_CONFIG_DIR/plugins/known_marketplaces.json"
 
       chmod -R u+rw "$CLAUDE_CONFIG_DIR" 2>/dev/null || true
   '';
@@ -305,6 +306,7 @@ let
     NIX_SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
     NODE_OPTIONS = "--max-old-space-size=4096";
     CLAUDE_CONFIG_DIR = "/env/.claude";
+    CLAUDE_CODE_PLUGIN_SEED_DIR = "/env/.claude-plugin-seed";
     ZSH = "${pkgs.oh-my-zsh}/share/oh-my-zsh";
     ZSH_CACHE_DIR = "/home/yoda/.cache/oh-my-zsh";
     GIT_CONFIG_GLOBAL = "/home/yoda/.gitconfig.local";
@@ -330,7 +332,7 @@ in pkgs.dockerTools.buildLayeredImage {
   inherit name tag;
   contents = [
     env entrypoint pkgs.dockerTools.usrBinEnv
-  ] ++ skillPaths;
+  ];
   config = {
     Cmd = [ "${entrypoint}/bin/jedicave-start" ];
     User = "1000:1000";
@@ -341,7 +343,7 @@ in pkgs.dockerTools.buildLayeredImage {
     # Directories
     mkdir -p ./home/yoda/.cache/oh-my-zsh ./workspace ./commandhistory
     mkdir -p -m 1777 ./tmp
-    mkdir -p ./env/.claude/plugins ./etc
+    mkdir -p ./env/.claude ./etc
 
     # User database
     echo 'root:x:0:0:root:/root:${pkgs.bashInteractive}/bin/bash' > ./etc/passwd
@@ -356,19 +358,17 @@ in pkgs.dockerTools.buildLayeredImage {
     cp ${configDir}/gitignore_global ./home/yoda/.gitignore_global
     cp ${gitconfigLocal}           ./home/yoda/.gitconfig.local
 
-    # Claude settings + plugins
+    # Claude settings + plugin seed
     ${if hasClaude then ''
-    cp ${claudeSettingsFile}      ./env/.claude/settings.json
-    cp ${knownMarketplaces}   ./env/.claude/plugins/known_marketplaces.json
-    '' else ""}
-    ${if hasClaude && pluginsSrc != null then ''
-    # Marketplace source (for /plugin browse)
-    mkdir -p ./env/.claude/plugins/marketplaces/claude-plugins-official
-    cp -r ${pluginsSrc}/. ./env/.claude/plugins/marketplaces/claude-plugins-official/
+    cp ${claudeSettingsFile} ./env/.claude/settings.json
 
-    # Pre-installed plugins
-    ${pluginCopyCommands}
-    cp ${installedPluginsFile} ./env/.claude/plugins/installed_plugins.json
+    # Plugin seed dir (CLAUDE_CODE_PLUGIN_SEED_DIR points here). Read-only at
+    # runtime — Claude Code probes marketplaces/<name>/ and cache/<m>/<p>/<v>/
+    # and uses on-disk content without cloning.
+    mkdir -p ./env/.claude-plugin-seed
+    cp ${knownMarketplaces} ./env/.claude-plugin-seed/known_marketplaces.json
+    ${marketplaceCopyCommands}
+    ${if pluginsSrc != null then pluginCopyCommands else ""}
     '' else ""}
 
     # Shell history placeholders

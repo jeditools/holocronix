@@ -28,16 +28,18 @@
         # hermes-agent excluded — depends on litellm (supply chain compromise, 2026-03)
       };
 
+      # Keys must match the `name` field in each repo's .claude-plugin/marketplace.json,
+      # because Claude Code probes $CLAUDE_CODE_PLUGIN_SEED_DIR/marketplaces/<name>/.
       defaultSkills = {
-        skills = {
+        anthropic-agent-skills = {
           repo = "anthropics/skills";
           path = skills-anthropic;
         };
-        trailofbits-skills = {
+        trailofbits = {
           repo = "trailofbits/skills";
           path = skills-tob;
         };
-        trailofbits-skills-curated = {
+        skills-curated = {
           repo = "trailofbits/skills-curated";
           path = skills-tob-curated;
         };
