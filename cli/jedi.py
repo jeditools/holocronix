@@ -1218,6 +1218,7 @@ def seed(
     branch: Annotated[Optional[str], typer.Option(help="Branch to seed (default: current branch)")] = None,
     all_branches: Annotated[bool, typer.Option("--all", help="Seed all branches")] = False,
     force: Annotated[bool, typer.Option("--force", "-f", help="Force-push (overwrite diverged branches)")] = False,
+    depth: Annotated[Optional[int], typer.Option(help="Shallow clone with N commits of history")] = None,
 ):
     """Seed a repo into the cave as a bare repo for secure git handoff."""
     name, d = resolve_cave(name)
@@ -1249,7 +1250,11 @@ def seed(
         err_console.print(f"[red]{repo} is not a git repository[/]")
         raise typer.Exit(1)
 
-    # Determine branch to push
+    if depth is not None and depth < 1:
+        err_console.print("[red]--depth must be at least 1[/]")
+        raise typer.Exit(1)
+
+    # Determine branch to push/clone
     if not all_branches and not branch:
         result = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
@@ -1263,41 +1268,77 @@ def seed(
     repo_name = repo.name
     bare_path = d / "repos" / f"{repo_name}.git"
 
-    # Init bare repo if needed
-    if not (bare_path / "HEAD").exists():
-        bare_path.mkdir(parents=True, exist_ok=True)
-        run(["git", "init", "--bare", str(bare_path)])
+    if depth:
+        # Shallow clone: create a truncated bare repo with limited history.
+        if (bare_path / "HEAD").exists():
+            if not force:
+                err_console.print(
+                    f"[red]Bare repo already exists at {bare_path}[/]\n"
+                    "  Use --force to replace it with a shallow clone"
+                )
+                raise typer.Exit(1)
+            trash_dir = d / ".trash"
+            trash_dir.mkdir(exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            trash_dest = trash_dir / f"{repo_name}.git.{timestamp}"
+            bare_path.rename(trash_dest)
+            console.print(f"[dim]  Moved existing bare repo to {trash_dest}[/]")
 
-    # Store source repo path for harvest
-    run(["git", "--git-dir", str(bare_path), "config",
-         "jedicave.sourceRepo", str(repo)], check=False)
-
-    # Push branches
-    push_cmd = ["git", "push"] + (["--force"] if force else [])
-    try:
+        clone_cmd = ["git", "clone", "--bare", f"--depth={depth}"]
         if all_branches:
-            run(push_cmd + [str(bare_path), "--all"], cwd=repo)
-            # Set HEAD to the current branch if possible
-            result = subprocess.run(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                cwd=repo, capture_output=True, text=True,
-            )
-            head_branch = result.stdout.strip()
-            if head_branch and head_branch != "HEAD":
-                run(["git", "--git-dir", str(bare_path),
-                     "symbolic-ref", "HEAD", f"refs/heads/{head_branch}"])
+            clone_cmd.append("--no-single-branch")
         else:
-            run(push_cmd + [str(bare_path),
-                 f"refs/heads/{branch}:refs/heads/{branch}"], cwd=repo)
-            # Set HEAD to the seeded branch
-            run(["git", "--git-dir", str(bare_path),
-                 "symbolic-ref", "HEAD", f"refs/heads/{branch}"])
-    except subprocess.CalledProcessError:
-        err_console.print(
-            "[red]Push rejected — the bare repo has diverged (e.g. from harvested agent commits).[/]\n"
-            "  Re-run with [bold]--force[/] to overwrite: [dim]jedi seed --force ...[/]"
-        )
-        raise typer.Exit(1)
+            clone_cmd.extend(["--single-branch", "--branch", branch])
+        clone_cmd.extend([str(repo), str(bare_path)])
+
+        try:
+            run(clone_cmd)
+        except subprocess.CalledProcessError:
+            err_console.print("[red]Shallow clone failed[/]")
+            raise typer.Exit(1)
+
+        # Store metadata
+        run(["git", "--git-dir", str(bare_path), "config",
+             "jedicave.sourceRepo", str(repo)], check=False)
+        run(["git", "--git-dir", str(bare_path), "config",
+             "jedicave.depth", str(depth)], check=False)
+
+    else:
+        # Full seed: init bare repo + push branches.
+        if not (bare_path / "HEAD").exists():
+            bare_path.mkdir(parents=True, exist_ok=True)
+            run(["git", "init", "--bare", str(bare_path)])
+
+        # Store source repo path for harvest
+        run(["git", "--git-dir", str(bare_path), "config",
+             "jedicave.sourceRepo", str(repo)], check=False)
+
+        # Push branches
+        push_cmd = ["git", "push"] + (["--force"] if force else [])
+        try:
+            if all_branches:
+                run(push_cmd + [str(bare_path), "--all"], cwd=repo)
+                # Set HEAD to the current branch if possible
+                result = subprocess.run(
+                    ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                    cwd=repo, capture_output=True, text=True,
+                )
+                head_branch = result.stdout.strip()
+                if head_branch and head_branch != "HEAD":
+                    run(["git", "--git-dir", str(bare_path),
+                         "symbolic-ref", "HEAD", f"refs/heads/{head_branch}"])
+            else:
+                run(push_cmd + [str(bare_path),
+                     f"refs/heads/{branch}:refs/heads/{branch}"], cwd=repo)
+                # Set HEAD to the seeded branch
+                run(["git", "--git-dir", str(bare_path),
+                     "symbolic-ref", "HEAD", f"refs/heads/{branch}"])
+        except subprocess.CalledProcessError:
+            err_console.print(
+                "[red]Push rejected — the bare repo has diverged (e.g. from harvested agent commits).[/]\n"
+                "  Re-run with [bold]--force[/] to overwrite: [dim]jedi seed --force ...[/]"
+            )
+            raise typer.Exit(1)
 
     # Record seeded commit count for harvest reporting
     count_result = subprocess.run(
@@ -1318,6 +1359,8 @@ def seed(
     else:
         console.print(f"[green]Seeded '{repo_name}' branch '{branch}' into cave '{name}'[/]")
     console.print(f"  Bare repo: {bare_path}")
+    if depth:
+        console.print(f"  Depth: {depth} commit(s)")
     console.print(f"  Will be available at /workspace/{repo_name} inside the container")
 
 
