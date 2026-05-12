@@ -279,6 +279,19 @@ let
         if [ ! -d "/workspace/$repo_name" ]; then
           echo "[jedicave] Cloning $repo_name..."
           git clone "$bare" "/workspace/$repo_name"
+          # Materialize every seeded branch as a local tracking branch.
+          # Why: a default `git clone` only creates one local branch (HEAD),
+          # leaving other seeded branches reachable only via `origin/<name>`.
+          git -C "/workspace/$repo_name" for-each-ref \
+            --format='%(refname:short)' refs/remotes/origin/ |
+            while read -r remote_ref; do
+              branch="''${remote_ref#origin/}"
+              [ "$branch" = "HEAD" ] && continue
+              git -C "/workspace/$repo_name" show-ref --verify --quiet \
+                "refs/heads/$branch" ||
+                git -C "/workspace/$repo_name" branch --track \
+                  "$branch" "$remote_ref"
+            done
         fi
       done
     fi
