@@ -114,17 +114,110 @@ def _clear_compose_project_name(d: Path):
         env_file.unlink()
 
 
-def run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess:
+def run(cmd: list[str], cwd: Path | None = None, check: bool = True,
+        env: dict | None = None) -> subprocess.CompletedProcess:
     console.print(f"[dim]  {' '.join(cmd)}[/]")
-    return subprocess.run(cmd, cwd=cwd, check=check)
+    return subprocess.run(cmd, cwd=cwd, check=check, env=env)
 
 
-def is_cave_running(d: Path) -> bool:
+def _read_env_project_name(d: Path) -> str | None:
+    """Read COMPOSE_PROJECT_NAME from the cave's .env (set by rename)."""
+    env_file = d / ".env"
+    if not env_file.exists():
+        return None
+    for line in env_file.read_text().splitlines():
+        s = line.strip()
+        if s.startswith("COMPOSE_PROJECT_NAME="):
+            return s.split("=", 1)[1]
+    return None
+
+
+def compose_project(d: Path, cave_name: str, session: str = "default") -> str:
+    """Compose project name for a (cave, session).
+
+    Default session keeps the bare cave name to preserve existing volumes;
+    other sessions are namespaced as ``<cave>-<session>``. The default
+    session also honours the .env COMPOSE_PROJECT_NAME override used by
+    ``jedi rename`` while the cave is running.
+    """
+    if session == "default":
+        override = _read_env_project_name(d)
+        if override:
+            return override
+        return cave_name
+    return f"{cave_name}-{session}"
+
+
+def compose_env(session: str = "default") -> dict:
+    """Process env for ``docker compose`` calls — passes JEDI_SESSION
+    so compose.yml label substitution resolves correctly."""
+    env = os.environ.copy()
+    env["JEDI_SESSION"] = session
+    return env
+
+
+def compose_cmd(d: Path, cave_name: str, session: str = "default") -> list[str]:
+    """Base ``docker compose`` invocation scoped to one session."""
+    return ["docker", "compose", "-p", compose_project(d, cave_name, session)]
+
+
+def is_session_running(d: Path, cave_name: str, session: str = "default") -> bool:
+    """True if the named session has a running shell container."""
     result = subprocess.run(
-        ["docker", "compose", "ps", "-q", COMPOSE_SERVICE],
-        cwd=d, capture_output=True, text=True
+        compose_cmd(d, cave_name, session) + ["ps", "-q", COMPOSE_SERVICE],
+        cwd=d, capture_output=True, text=True, env=compose_env(session),
     )
     return bool(result.stdout.strip())
+
+
+def is_cave_running(d: Path, cave_name: str | None = None) -> bool:
+    """True if any session of the cave is running."""
+    if cave_name is None:
+        cave_name = d.name
+    return any(s["running"] for s in list_sessions(d, cave_name))
+
+
+def list_sessions(d: Path, cave_name: str) -> list[dict]:
+    """List sessions for a cave by inspecting docker container labels.
+
+    Returns ``[{session, running}, ...]`` sorted by session name.
+    """
+    result = subprocess.run(
+        ["docker", "ps", "-a",
+         "--filter", f"label=jedi.cave={cave_name}",
+         "--filter", f"label=com.docker.compose.service={COMPOSE_SERVICE}",
+         "--format", '{{.Label "jedi.session"}}|{{.State}}'],
+        capture_output=True, text=True,
+    )
+    seen: dict[str, bool] = {}
+    for line in result.stdout.strip().splitlines():
+        if "|" not in line:
+            continue
+        session, state = line.split("|", 1)
+        if not session:
+            session = "default"
+        seen.setdefault(session, False)
+        if state == "running":
+            seen[session] = True
+    return [{"session": s, "running": r} for s, r in sorted(seen.items())]
+
+
+def complete_session_name(ctx: typer.Context, incomplete: str) -> list[str]:
+    """Tab-completion for --session: pulls running sessions of the resolved cave."""
+    name = ctx.params.get("name")
+    if not name:
+        caves = _list_caves()
+        active = CAVES_DIR / ".active"
+        if active.exists() and active.read_text().strip() in caves:
+            name = active.read_text().strip()
+        elif len(caves) == 1:
+            name = caves[0]
+        else:
+            return []
+    d = CAVES_DIR / name
+    if not d.is_dir():
+        return []
+    return [s["session"] for s in list_sessions(d, name) if s["session"].startswith(incomplete)]
 
 
 def _load_policy(d: Path) -> dict:
@@ -456,6 +549,9 @@ def _generate_compose(name: str, policy: dict) -> str:
       - no-new-privileges:true
       - seccomp:seccomp.json
     working_dir: /workspace
+    labels:
+      jedi.cave: {name}
+      jedi.session: ${{JEDI_SESSION:-default}}
     environment:
 {env_block}
     env_file:
@@ -927,9 +1023,11 @@ def build(
 @app.command()
 def up(
     name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
+    session: Annotated[str, typer.Option("--session", "-s", help="Session name (default 'default'); use distinct names to run parallel containers from the same cave",
+                                          autocompletion=complete_session_name)] = "default",
     firewall: Annotated[bool, typer.Option(help="Enable firewall on startup")] = True,
 ):
-    """Start cave container."""
+    """Start cave container (one session)."""
     name, d = resolve_cave(name)
     policy = _load_policy(d)
     _write_compose(d, name, policy)
@@ -937,29 +1035,51 @@ def up(
     if env_file:
         console.print(f"[dim]  resolved {len(policy.get('secrets') or {})} secrets → {env_file.name}[/]")
 
-    console.print(f"Starting cave [cyan]{name}[/]...")
-    run(["docker", "compose", "up", "-d"], cwd=d)
+    cenv = compose_env(session)
+    base = compose_cmd(d, name, session)
+    label = f"{name}/{session}" if session != "default" else name
+    console.print(f"Starting cave [cyan]{label}[/]...")
+    run(base + ["up", "-d"], cwd=d, env=cenv)
     if firewall:
         fw_cmds = firewall_commands(d)
-        run(["docker", "compose", "exec", "--user", "root", COMPOSE_SERVICE,
-             "bash", "-c", fw_cmds], cwd=d)
-        console.print(f"[green]Cave '{name}' running (firewall on)[/]")
+        run(base + ["exec", "--user", "root", COMPOSE_SERVICE,
+                    "bash", "-c", fw_cmds], cwd=d, env=cenv)
+        console.print(f"[green]Cave '{label}' running (firewall on)[/]")
     else:
-        console.print(f"[green]Cave '{name}' running[/]")
-    console.print(f"Run: jedi enter {name}")
+        console.print(f"[green]Cave '{label}' running[/]")
+    enter_args = name if session == "default" else f"{name} -s {session}"
+    console.print(f"Run: jedi enter {enter_args}")
 
 
 @app.command()
 def down(
     name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
+    session: Annotated[Optional[str], typer.Option("--session", "-s", help="Session name (default 'default'); use --all to stop every running session",
+                                                    autocompletion=complete_session_name)] = None,
+    all_sessions: Annotated[bool, typer.Option("--all", help="Stop every running session for this cave")] = False,
 ):
-    """Stop cave container."""
+    """Stop cave container(s)."""
     name, d = resolve_cave(name)
-    console.print(f"Stopping cave [cyan]{name}[/]...")
-    run(["docker", "compose", "down"], cwd=d)
-    _clear_compose_project_name(d)
-    _clear_secrets(d)
-    console.print(f"[green]Cave '{name}' stopped[/]")
+
+    if all_sessions:
+        sessions = [s["session"] for s in list_sessions(d, name) if s["running"]]
+        if not sessions:
+            console.print(f"No running sessions for cave '{name}'")
+            return
+    else:
+        sessions = [session or "default"]
+
+    for s in sessions:
+        label = f"{name}/{s}" if s != "default" else name
+        console.print(f"Stopping cave [cyan]{label}[/]...")
+        run(compose_cmd(d, name, s) + ["down"], cwd=d, env=compose_env(s))
+        if s == "default":
+            _clear_compose_project_name(d)
+        console.print(f"[green]Cave '{label}' stopped[/]")
+
+    # Secrets file is per-cave; clear it once all sessions are down
+    if not any(x["running"] for x in list_sessions(d, name)):
+        _clear_secrets(d)
 
 
 @app.command()
@@ -1010,57 +1130,76 @@ def rename(
 @app.command()
 def restart(
     name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
+    session: Annotated[str, typer.Option("--session", "-s", help="Session name",
+                                          autocompletion=complete_session_name)] = "default",
     firewall: Annotated[bool, typer.Option(help="Enable firewall on startup")] = True,
 ):
-    """Restart cave container (down + up)."""
+    """Restart cave container (down + up) for one session."""
     name, d = resolve_cave(name)
     policy = _load_policy(d)
 
-    console.print(f"Restarting cave [cyan]{name}[/]...")
-    run(["docker", "compose", "down"], cwd=d)
-    _clear_compose_project_name(d)
-    _clear_secrets(d)
+    label = f"{name}/{session}" if session != "default" else name
+    cenv = compose_env(session)
+    base = compose_cmd(d, name, session)
+
+    console.print(f"Restarting cave [cyan]{label}[/]...")
+    run(base + ["down"], cwd=d, env=cenv)
+    if session == "default":
+        _clear_compose_project_name(d)
+    if not any(x["running"] for x in list_sessions(d, name)):
+        _clear_secrets(d)
 
     _write_compose(d, name, policy)
     env_file = _resolve_secrets(d, policy)
     if env_file:
         console.print(f"[dim]  resolved {len(policy.get('secrets') or {})} secrets → {env_file.name}[/]")
 
-    run(["docker", "compose", "up", "-d"], cwd=d)
+    run(base + ["up", "-d"], cwd=d, env=cenv)
     if firewall:
         fw_cmds = firewall_commands(d)
-        run(["docker", "compose", "exec", "--user", "root", COMPOSE_SERVICE,
-             "bash", "-c", fw_cmds], cwd=d)
-        console.print(f"[green]Cave '{name}' restarted (firewall on)[/]")
+        run(base + ["exec", "--user", "root", COMPOSE_SERVICE,
+                    "bash", "-c", fw_cmds], cwd=d, env=cenv)
+        console.print(f"[green]Cave '{label}' restarted (firewall on)[/]")
     else:
-        console.print(f"[green]Cave '{name}' restarted[/]")
+        console.print(f"[green]Cave '{label}' restarted[/]")
 
 
 @app.command()
 def shell(
     name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
+    session: Annotated[str, typer.Option("--session", "-s", help="Session name",
+                                          autocompletion=complete_session_name)] = "default",
     firewall: Annotated[bool, typer.Option(help="Enable firewall")] = True,
 ):
     """Ephemeral shell (no 'up' needed)."""
     name, d = resolve_cave(name)
+    project = compose_project(d, name, session)
+    os.environ["JEDI_SESSION"] = session
     if firewall:
         fw_cmds = firewall_commands(d)
-        os.execvp("docker", ["docker", "compose", "--project-directory", str(d),
+        os.execvp("docker", ["docker", "compose", "-p", project,
+                              "--project-directory", str(d),
                               "run", "--rm", "-it", "--user", "root",
                               COMPOSE_SERVICE, "bash", "-c",
                               f"{fw_cmds} && exec su -s /bin/zsh yoda"])
     else:
-        os.execvp("docker", ["docker", "compose", "--project-directory", str(d),
+        os.execvp("docker", ["docker", "compose", "-p", project,
+                              "--project-directory", str(d),
                               "run", "--rm", "-it", COMPOSE_SERVICE, "zsh"])
 
 
 @app.command()
 def enter(
     name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
+    session: Annotated[str, typer.Option("--session", "-s", help="Session name",
+                                          autocompletion=complete_session_name)] = "default",
 ):
     """Enter a running cave (requires 'up')."""
     name, d = resolve_cave(name)
-    os.execvp("docker", ["docker", "compose", "--project-directory", str(d),
+    project = compose_project(d, name, session)
+    os.environ["JEDI_SESSION"] = session
+    os.execvp("docker", ["docker", "compose", "-p", project,
+                          "--project-directory", str(d),
                           "exec", COMPOSE_SERVICE, "zsh"])
 
 
@@ -1068,10 +1207,15 @@ def enter(
 def exec(
     ctx: typer.Context,
     name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
+    session: Annotated[str, typer.Option("--session", "-s", help="Session name",
+                                          autocompletion=complete_session_name)] = "default",
 ):
     """Run a command in a running cave (requires 'up')."""
     name, d = resolve_cave(name)
-    os.execvp("docker", ["docker", "compose", "--project-directory", str(d),
+    project = compose_project(d, name, session)
+    os.environ["JEDI_SESSION"] = session
+    os.execvp("docker", ["docker", "compose", "-p", project,
+                          "--project-directory", str(d),
                           "exec", COMPOSE_SERVICE] + ctx.args)
 
 
@@ -1080,6 +1224,8 @@ def cp(
     src: Annotated[str, typer.Argument(help="Source path (prefix with : for container path)")],
     dst: Annotated[str, typer.Argument(help="Destination path (prefix with : for container path)")],
     name: Annotated[Optional[str], typer.Option("--cave", "-c", help="Cave name", autocompletion=complete_cave_name)] = None,
+    session: Annotated[str, typer.Option("--session", "-s", help="Session name",
+                                          autocompletion=complete_session_name)] = "default",
 ):
     """Copy files between host and cave container.
 
@@ -1092,17 +1238,18 @@ def cp(
     """
     name, d = resolve_cave(name)
 
-    if not is_cave_running(d):
-        err_console.print(f"[red]Cave '{name}' is not running.[/] Start it first: jedi up {name}")
+    if not is_session_running(d, name, session):
+        label = f"{name}/{session}" if session != "default" else name
+        err_console.print(f"[red]Cave '{label}' is not running.[/] Start it first: jedi up {name}{' -s ' + session if session != 'default' else ''}")
         raise typer.Exit(1)
 
     container_id = subprocess.run(
-        ["docker", "compose", "ps", "-q", COMPOSE_SERVICE],
-        cwd=d, capture_output=True, text=True,
+        compose_cmd(d, name, session) + ["ps", "-q", COMPOSE_SERVICE],
+        cwd=d, capture_output=True, text=True, env=compose_env(session),
     ).stdout.strip()
 
     if not container_id:
-        err_console.print(f"[red]Could not find container for cave '{name}'[/]")
+        err_console.print(f"[red]Could not find container for cave '{name}/{session}'[/]")
         raise typer.Exit(1)
 
     if src.startswith(":") and dst.startswith(":"):
@@ -1138,13 +1285,51 @@ def list_cmd():
     table = Table()
     table.add_column("Cave", style="cyan")
     table.add_column("Status")
+    table.add_column("Sessions", style="magenta")
     table.add_column("Path", style="dim")
 
     for name in caves:
         d = cave_dir(name)
-        running = is_cave_running(d)
-        status = "[green]running[/]" if running else "[dim]stopped[/]"
-        table.add_row(name, status, str(d))
+        sessions = list_sessions(d, name)
+        running_names = [s["session"] for s in sessions if s["running"]]
+        if running_names:
+            status = "[green]running[/]"
+            sess_str = ", ".join(running_names)
+        else:
+            status = "[dim]stopped[/]"
+            sess_str = "-"
+        table.add_row(name, status, sess_str, str(d))
+
+    console.print(table)
+
+
+@app.command()
+def sessions(
+    name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
+):
+    """List sessions for a cave.
+
+    A session is one container instance spawned from a cave. Multiple
+    sessions can run in parallel from the same cave — they share the
+    cave's bare repos read-only and isolate their workspace and
+    harvested commits under refs/sessions/<session>/heads/*.
+    """
+    name, d = resolve_cave(name)
+    sess = list_sessions(d, name)
+
+    if not sess:
+        console.print(f"No sessions for cave '{name}'. Start one: jedi up {name}")
+        return
+
+    table = Table(title=f"Sessions for cave '{name}'")
+    table.add_column("Session", style="magenta")
+    table.add_column("Status")
+    table.add_column("Compose project", style="dim")
+
+    for s in sess:
+        status = "[green]running[/]" if s["running"] else "[dim]stopped[/]"
+        project = compose_project(d, name, s["session"])
+        table.add_row(s["session"], status, project)
 
     console.print(table)
 
@@ -1159,39 +1344,46 @@ class FirewallAction(str, Enum):
 def firewall(
     action: Annotated[FirewallAction, typer.Argument(help="Firewall action")],
     name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
+    session: Annotated[str, typer.Option("--session", "-s", help="Session name",
+                                          autocompletion=complete_session_name)] = "default",
     verbose: Annotated[bool, typer.Option("-v", "--verbose", help="Show full iptables output")] = False,
 ):
     """Manage cave firewall."""
     name, d = resolve_cave(name)
 
-    if not is_cave_running(d):
+    if not is_session_running(d, name, session):
+        label = f"{name}/{session}" if session != "default" else name
+        flag = f" -s {session}" if session != "default" else ""
         err_console.print(
-            f"[red]Cave '{name}' is not running.[/] Start it first:\n"
-            f"  jedi up {name}\n"
-            f"  jedi up --firewall {name}\n"
-            f"Or use: jedi shell --firewall {name}"
+            f"[red]Cave '{label}' is not running.[/] Start it first:\n"
+            f"  jedi up {name}{flag}\n"
+            f"  jedi up --firewall {name}{flag}\n"
+            f"Or use: jedi shell --firewall {name}{flag}"
         )
         raise typer.Exit(1)
 
+    cenv = compose_env(session)
+    base = compose_cmd(d, name, session)
+
     if action == FirewallAction.on:
         fw_cmds = firewall_commands(d)
-        run(["docker", "compose", "exec", "--user", "root", COMPOSE_SERVICE,
-             "bash", "-c", fw_cmds], cwd=d)
+        run(base + ["exec", "--user", "root", COMPOSE_SERVICE,
+                    "bash", "-c", fw_cmds], cwd=d, env=cenv)
         domains = _policy_domains(_load_policy(d))
         console.print(f"[green]Firewall enabled ({len(domains)} domains allowlisted)[/]")
 
     elif action == FirewallAction.off:
         ipt = "/usr/local/sbin/iptables"
-        run(["docker", "compose", "exec", "--user", "root", COMPOSE_SERVICE,
-             "bash", "-c",
-             f"{ipt} -F OUTPUT && {ipt} -P OUTPUT ACCEPT"], cwd=d)
+        run(base + ["exec", "--user", "root", COMPOSE_SERVICE,
+                    "bash", "-c",
+                    f"{ipt} -F OUTPUT && {ipt} -P OUTPUT ACCEPT"], cwd=d, env=cenv)
         console.print("[green]Firewall disabled[/]")
 
     elif action == FirewallAction.status:
         result = subprocess.run(
-            ["docker", "compose", "exec", "--user", "root", COMPOSE_SERVICE,
-             "/usr/local/sbin/iptables", "-L", "OUTPUT", "-n"],
-            cwd=d, capture_output=True, text=True
+            base + ["exec", "--user", "root", COMPOSE_SERVICE,
+                    "/usr/local/sbin/iptables", "-L", "OUTPUT", "-n"],
+            cwd=d, capture_output=True, text=True, env=cenv,
         )
         lines = result.stdout.strip().splitlines()
         rules = [l for l in lines[2:] if l.strip()] if len(lines) > 2 else []
@@ -1207,8 +1399,8 @@ def firewall(
 
         if verbose:
             console.print()
-            run(["docker", "compose", "exec", "--user", "root", COMPOSE_SERVICE,
-                 "/usr/local/sbin/iptables", "-L", "-n", "-v"], cwd=d)
+            run(base + ["exec", "--user", "root", COMPOSE_SERVICE,
+                        "/usr/local/sbin/iptables", "-L", "-n", "-v"], cwd=d, env=cenv)
 
 
 @app.command()
@@ -1486,11 +1678,101 @@ def unseed(
         console.print("Aborted")
 
 
+def _session_ref_glob(session: str) -> str:
+    """Refspec namespace inside the bare repo for a session's harvested work."""
+    return f"refs/sessions/{session}/heads"
+
+
+def _bare_session_tips(bare: Path, session: str) -> set:
+    """Commit hashes at the tips of refs/sessions/<session>/heads/* in a bare repo."""
+    result = subprocess.run(
+        ["git", "--git-dir", str(bare), "for-each-ref",
+         "--format=%(objectname)", f"{_session_ref_glob(session)}/*"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return set()
+    return set(result.stdout.strip().splitlines())
+
+
+def _bare_seed_tips(bare: Path) -> set:
+    """Commit hashes at the tips of refs/heads/* (the seeded base) in a bare repo."""
+    result = subprocess.run(
+        ["git", "--git-dir", str(bare), "rev-parse", "--branches"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return set()
+    return set(result.stdout.strip().splitlines())
+
+
+def _sync_session(d: Path, name: str, session: str, bare_repos: list[Path]) -> set:
+    """Bundle each repo out of one session's container and fetch into the
+    bare under refs/sessions/<session>/heads/*. Returns the set of repo
+    names that were synced (i.e. the repo existed in /workspace/)."""
+    cenv = compose_env(session)
+    base = compose_cmd(d, name, session)
+    container_id = subprocess.run(
+        base + ["ps", "-q", COMPOSE_SERVICE],
+        cwd=d, capture_output=True, text=True, env=cenv,
+    ).stdout.strip()
+    if not container_id:
+        return set()
+
+    synced = set()
+    for bare in bare_repos:
+        rn = bare.name[:-4]
+        workdir = f"/workspace/{rn}"
+        bundle_path = f"/tmp/{rn}.bundle"
+
+        check = subprocess.run(
+            base + ["exec", COMPOSE_SERVICE, "test", "-d", workdir],
+            cwd=d, capture_output=True, env=cenv,
+        )
+        if check.returncode != 0:
+            continue
+
+        result = subprocess.run(
+            base + ["exec", "-w", workdir, COMPOSE_SERVICE,
+                    "git", "bundle", "create", bundle_path, "--all"],
+            cwd=d, capture_output=True, text=True, env=cenv,
+        )
+        if result.returncode != 0:
+            err_console.print(f"[yellow]Could not bundle '{rn}' from '{session}': {result.stderr.strip()}[/]")
+            continue
+
+        host_bundle = d / "repos" / f"{rn}.{session}.bundle"
+        result = subprocess.run(
+            ["docker", "cp", f"{container_id}:{bundle_path}", str(host_bundle)],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            err_console.print(f"[yellow]Could not extract bundle for '{rn}' from '{session}'[/]")
+            continue
+
+        refspec = f"+refs/heads/*:{_session_ref_glob(session)}/*"
+        subprocess.run(
+            ["git", "--git-dir", str(bare), "fetch", str(host_bundle), refspec],
+            capture_output=True, text=True,
+        )
+        host_bundle.unlink(missing_ok=True)
+        synced.add(rn)
+
+    return synced
+
+
 @app.command()
 def harvest(
     name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
+    session: Annotated[Optional[str], typer.Option("--session", "-s", help="Session to harvest (default: all running sessions)",
+                                                    autocompletion=complete_session_name)] = None,
 ):
-    """Show agent commits in cave repos and how to fetch them."""
+    """Show agent commits in cave repos and how to fetch them.
+
+    Each session's work is namespaced into the bare repo under
+    refs/sessions/<session>/heads/*, so parallel sessions never clobber
+    each other's branches.
+    """
     name, d = resolve_cave(name)
     repos_dir = d / "repos"
 
@@ -1507,188 +1789,143 @@ def harvest(
         console.print("No repos seeded. Run: jedi seed <repo-path>")
         return
 
-    running = is_cave_running(d)
+    # Resolve which session(s) to harvest
+    running_sessions = [s["session"] for s in list_sessions(d, name) if s["running"]]
+    if session:
+        sessions_to_sync = [session] if session in running_sessions else []
+        if not sessions_to_sync:
+            err_console.print(f"[yellow]Session '{session}' is not running for cave '{name}'[/]")
+    else:
+        sessions_to_sync = running_sessions
 
-    # Track pre-harvest branch tips per repo to identify new agent commits
-    pre_harvest_tips = {}  # repo_name -> set of commit hashes
-
-    def get_branch_tips(bare_path):
-        """Get all branch tip commit hashes from a bare repo."""
-        result = subprocess.run(
-            ["git", "--git-dir", str(bare_path), "rev-parse", "--branches"],
-            capture_output=True, text=True,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return set(result.stdout.strip().splitlines())
-        return set()
-
-    # Snapshot current branch tips before sync
-    for bare in bare_repos:
-        rn = bare.name[:-4]
-        pre_harvest_tips[rn] = get_branch_tips(bare)
-
-    # Sync agent commits from container into bare repos via bundle
-    if running:
-        container_id = subprocess.run(
-            ["docker", "compose", "ps", "-q", COMPOSE_SERVICE],
-            cwd=d, capture_output=True, text=True,
-        ).stdout.strip()
-
+    # Snapshot pre-sync tips per (session, repo) so we can flag what's new.
+    pre_tips: dict[tuple[str, str], set] = {}
+    for s in sessions_to_sync:
         for bare in bare_repos:
-            rn = bare.name[:-4]
-            workdir = f"/workspace/{rn}"
-            bundle_path = f"/tmp/{rn}.bundle"
+            pre_tips[(s, bare.name[:-4])] = _bare_session_tips(bare, s)
 
-            # Check if repo exists in container
-            check = subprocess.run(
-                ["docker", "compose", "exec", COMPOSE_SERVICE, "test", "-d", workdir],
-                cwd=d, capture_output=True,
-            )
-            if check.returncode != 0:
-                continue
+    synced_per_session: dict[str, set] = {}
+    for s in sessions_to_sync:
+        synced_per_session[s] = _sync_session(d, name, s, bare_repos)
 
-            # Create bundle inside container
-            result = subprocess.run(
-                ["docker", "compose", "exec", "-w", workdir, COMPOSE_SERVICE,
-                 "git", "bundle", "create", bundle_path, "--all"],
-                cwd=d, capture_output=True, text=True,
-            )
-            if result.returncode != 0:
-                err_console.print(f"[yellow]Could not bundle '{rn}': {result.stderr.strip()}[/]")
-                continue
-
-            # Copy bundle out via docker cp
-            host_bundle = d / "repos" / f"{rn}.bundle"
-            result = subprocess.run(
-                ["docker", "cp", f"{container_id}:{bundle_path}", str(host_bundle)],
-                capture_output=True, text=True,
-            )
-            if result.returncode != 0:
-                err_console.print(f"[yellow]Could not extract bundle for '{rn}'[/]")
-                continue
-
-            # Fetch bundle into bare repo (update branch refs)
-            result = subprocess.run(
-                ["git", "--git-dir", str(bare), "fetch", str(host_bundle),
-                 "+refs/heads/*:refs/heads/*"],
-                capture_output=True, text=True,
-            )
-            if result.returncode == 0:
-                fetched = [l for l in result.stderr.strip().splitlines() if "->" in l]
-                if fetched:
-                    console.print(f"[green]Harvested new commits:[/] {rn}")
-
-            # Clean up bundle
-            host_bundle.unlink(missing_ok=True)
-
+    # Report per repo, splitting out per-session commits.
     for bare in bare_repos:
         repo_name = bare.name[:-4]
-        old_tips = pre_harvest_tips.get(repo_name, set())
+        seed_tips = _bare_seed_tips(bare)
+        seed_excl = [f"^{t}" for t in seed_tips]
 
-        # Build exclusion args: exclude commits reachable from pre-harvest tips
-        # This shows only commits added by the agent
-        exclude_args = [f"^{tip}" for tip in old_tips]
-
-        # Count new agent commits (not reachable from pre-harvest tips)
-        if old_tips:
-            count_result = subprocess.run(
-                ["git", "--git-dir", str(bare), "rev-list", "--all", "--count"] + exclude_args,
-                capture_output=True, text=True,
-            )
-            new_count = int(count_result.stdout.strip()) if count_result.returncode == 0 else 0
-
-            agent_result = subprocess.run(
-                ["git", "--git-dir", str(bare), "log", "--all",
-                 "--oneline", "--graph", "-30"] + exclude_args,
-                capture_output=True, text=True,
-            )
-            agent_log = agent_result.stdout.strip() if agent_result.returncode == 0 else ""
-        else:
-            new_count = 0
-            agent_log = ""
-
-        # Count total commits
-        total_result = subprocess.run(
-            ["git", "--git-dir", str(bare), "rev-list", "--all", "--count"],
-            capture_output=True, text=True,
-        )
-        total_count = int(total_result.stdout.strip()) if total_result.returncode == 0 else 0
-
-        # Get seeded commit count (set during jedi seed)
         seeded_result = subprocess.run(
             ["git", "--git-dir", str(bare), "config", "jedicave.seededCount"],
             capture_output=True, text=True,
         )
-        has_seeded_count = seeded_result.returncode == 0 and seeded_result.stdout.strip()
-        seeded_count = int(seeded_result.stdout.strip()) if has_seeded_count else None
+        seeded_count = int(seeded_result.stdout.strip()) if (
+            seeded_result.returncode == 0 and seeded_result.stdout.strip()
+        ) else None
+
+        # Discover all sessions that have ever pushed work into this bare,
+        # not just the ones we just synced — so 'harvest' is also a viewer.
+        all_session_refs = subprocess.run(
+            ["git", "--git-dir", str(bare), "for-each-ref",
+             "--format=%(refname)", "refs/sessions/"],
+            capture_output=True, text=True,
+        ).stdout.strip().splitlines()
+        all_sessions = sorted({
+            r.split("/", 3)[2] for r in all_session_refs if r.startswith("refs/sessions/")
+        })
 
         console.print(f"\n[cyan]{repo_name}[/]")
 
-        if new_count > 0:
-            summary = f"  [green]+{new_count} new[/]"
-            if seeded_count is not None:
-                agent_total = total_count - seeded_count
-                if agent_total > new_count:
-                    summary += f" ({agent_total} by agent, {total_count} total)"
-                else:
-                    summary += f" ({total_count} total)"
-            else:
-                summary += f" ({total_count} total)"
-            console.print(summary)
-            console.print(agent_log)
-        elif old_tips:
-            if seeded_count is not None:
-                agent_total = total_count - seeded_count
-                if agent_total > 0:
-                    console.print(f"  [dim]No new commits[/] ({agent_total} by agent, {total_count} total)")
-                else:
-                    console.print(f"  [dim]No new commits[/] ({total_count} total)")
-            else:
-                console.print(f"  [dim]No new commits[/] ({total_count} total)")
-        else:
-            # No pre-harvest tips means repo was empty before — all commits are agent's
-            result = subprocess.run(
-                ["git", "--git-dir", str(bare), "log", "--all",
-                 "--oneline", "--graph", "-30"],
+        if not all_sessions:
+            console.print("  [dim]No harvested work yet[/]")
+            continue
+
+        for s in all_sessions:
+            ns = _session_ref_glob(s)
+            session_tips = _bare_session_tips(bare, s)
+            if not session_tips:
+                continue
+
+            # New = added since pre-sync snapshot (only meaningful if we just synced this session)
+            old_tips = pre_tips.get((s, repo_name), session_tips)
+            new_excl = [f"^{t}" for t in old_tips]
+            new_count_r = subprocess.run(
+                ["git", "--git-dir", str(bare), "rev-list", "--count",
+                 f"--glob={ns}/*"] + new_excl,
                 capture_output=True, text=True,
             )
-            if result.stdout.strip():
-                console.print(f"  [green]+{total_count} new[/]")
-                console.print(result.stdout.strip())
+            new_count = int(new_count_r.stdout.strip()) if new_count_r.returncode == 0 else 0
+
+            # Agent total = commits in this session not reachable from the seed
+            agent_total_r = subprocess.run(
+                ["git", "--git-dir", str(bare), "rev-list", "--count",
+                 f"--glob={ns}/*"] + seed_excl,
+                capture_output=True, text=True,
+            )
+            agent_total = int(agent_total_r.stdout.strip()) if agent_total_r.returncode == 0 else 0
+
+            session_label = f"[magenta]{s}[/]"
+            running_marker = " [green]●[/]" if s in running_sessions else " [dim]○[/]"
+            line = f"  {session_label}{running_marker}"
+            if new_count > 0:
+                line += f"  [green]+{new_count} new[/]  ({agent_total} by agent)"
+            elif agent_total > 0:
+                line += f"  [dim]no new commits[/]  ({agent_total} by agent)"
             else:
-                console.print("  (no commits)")
+                line += "  [dim]no agent commits[/]"
+            if seeded_count is not None:
+                line += f"  [dim]| seed: {seeded_count}[/]"
+            console.print(line)
+
+            if new_count > 0:
+                log_r = subprocess.run(
+                    ["git", "--git-dir", str(bare), "log", "--oneline", "--graph",
+                     "-30", f"--glob={ns}/*"] + new_excl,
+                    capture_output=True, text=True,
+                )
+                if log_r.stdout.strip():
+                    for ln in log_r.stdout.rstrip().splitlines():
+                        console.print(f"    {ln}")
 
     console.print(f"\n  To fetch into your repos:")
     console.print(f"    jedi fetch {name}")
 
-    if running:
-        console.print(f"\n[dim]Tip: use 'jedi diff' to see uncommitted changes still inside the container[/]")
+    if running_sessions:
+        running_str = ", ".join(running_sessions)
+        console.print(f"\n[dim]Running sessions: {running_str}[/]")
+        console.print(f"[dim]Tip: use 'jedi diff' to see uncommitted changes still inside a container[/]")
     else:
-        console.print(f"\n[yellow]Cave is stopped — only showing previously harvested commits.[/]")
-        console.print(f"[yellow]Run 'jedi harvest' while the cave is running to sync agent commits.[/]")
+        console.print(f"\n[yellow]No sessions running — only showing previously harvested commits.[/]")
+        console.print(f"[yellow]Run 'jedi harvest' while a session is running to sync agent commits.[/]")
 
 
 @app.command()
 def diff(
     name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
+    session: Annotated[str, typer.Option("--session", "-s", help="Session name",
+                                          autocompletion=complete_session_name)] = "default",
     repo_name: Annotated[Optional[str], typer.Option("--repo", "-r", help="Specific repo (default: all)")] = None,
     stat: Annotated[bool, typer.Option("--stat", help="Show diffstat instead of full diff")] = False,
 ):
-    """Show uncommitted changes in workspace repos (requires running cave)."""
+    """Show uncommitted changes in workspace repos (requires a running session)."""
     name, d = resolve_cave(name)
 
-    if not is_cave_running(d):
-        err_console.print(f"[red]Cave '{name}' is not running.[/] Start it first: jedi up {name}")
+    if not is_session_running(d, name, session):
+        label = f"{name}/{session}" if session != "default" else name
+        flag = f" -s {session}" if session != "default" else ""
+        err_console.print(f"[red]Cave '{label}' is not running.[/] Start it first: jedi up {name}{flag}")
         raise typer.Exit(1)
+
+    cenv = compose_env(session)
+    base = compose_cmd(d, name, session)
 
     # Discover repos inside the container
     if repo_name:
         repos = [repo_name]
     else:
         result = subprocess.run(
-            ["docker", "compose", "exec", COMPOSE_SERVICE,
-             "sh", "-c", "ls -d /workspace/*/.git 2>/dev/null | xargs -I{} dirname {}"],
-            cwd=d, capture_output=True, text=True,
+            base + ["exec", COMPOSE_SERVICE,
+                    "sh", "-c", "ls -d /workspace/*/.git 2>/dev/null | xargs -I{} dirname {}"],
+            cwd=d, capture_output=True, text=True, env=cenv,
         )
         if not result.stdout.strip():
             console.print("No git repos found in /workspace/")
@@ -1700,8 +1937,8 @@ def diff(
 
         # Check repo exists
         check = subprocess.run(
-            ["docker", "compose", "exec", COMPOSE_SERVICE, "test", "-d", workdir],
-            cwd=d, capture_output=True,
+            base + ["exec", COMPOSE_SERVICE, "test", "-d", workdir],
+            cwd=d, capture_output=True, env=cenv,
         )
         if check.returncode != 0:
             err_console.print(f"[red]Repo '{rn}' not found in /workspace/[/]")
@@ -1712,9 +1949,9 @@ def diff(
         # Tracked changes
         diff_cmd = "git diff HEAD --stat" if stat else "git diff HEAD"
         result = subprocess.run(
-            ["docker", "compose", "exec", "-w", workdir, COMPOSE_SERVICE,
-             "sh", "-c", diff_cmd],
-            cwd=d, capture_output=True, text=True,
+            base + ["exec", "-w", workdir, COMPOSE_SERVICE,
+                    "sh", "-c", diff_cmd],
+            cwd=d, capture_output=True, text=True, env=cenv,
         )
         if result.stdout.strip():
             console.print(result.stdout.rstrip())
@@ -1723,9 +1960,9 @@ def diff(
 
         # Untracked files
         result = subprocess.run(
-            ["docker", "compose", "exec", "-w", workdir, COMPOSE_SERVICE,
-             "git", "ls-files", "--others", "--exclude-standard"],
-            cwd=d, capture_output=True, text=True,
+            base + ["exec", "-w", workdir, COMPOSE_SERVICE,
+                    "git", "ls-files", "--others", "--exclude-standard"],
+            cwd=d, capture_output=True, text=True, env=cenv,
         )
         untracked = result.stdout.strip().splitlines()
         if untracked:
@@ -1737,9 +1974,16 @@ def diff(
 @app.command()
 def fetch(
     name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
+    session: Annotated[Optional[str], typer.Option("--session", "-s", help="Session to sync first (default: all running). Has no effect on which refs are published to the source repo — every refs/sessions/<s>/heads/<b> becomes cave/<s>/<b>.",
+                                                    autocompletion=complete_session_name)] = None,
     repo_name: Annotated[Optional[str], typer.Option("--repo", "-r", help="Specific repo (default: all)")] = None,
 ):
-    """Fetch agent commits from cave into your source repos."""
+    """Fetch agent commits from cave into your source repos.
+
+    Each session's work lives under ``refs/sessions/<session>/heads/*`` in the
+    bare repo (populated by ``jedi harvest``). This command publishes those refs
+    into the source repo as ``cave/<session>/<branch>`` remote-tracking branches.
+    """
     name, d = resolve_cave(name)
     repos_dir = d / "repos"
 
@@ -1756,52 +2000,26 @@ def fetch(
         console.print("No repos seeded. Run: jedi seed <repo-path>")
         return
 
-    # If cave is running, sync first (same as harvest)
-    if is_cave_running(d):
-        container_id = subprocess.run(
-            ["docker", "compose", "ps", "-q", COMPOSE_SERVICE],
-            cwd=d, capture_output=True, text=True,
-        ).stdout.strip()
+    if repo_name:
+        bare_repos = [p for p in bare_repos if p.name == f"{repo_name}.git"]
+        if not bare_repos:
+            err_console.print(f"[red]No seeded repo '{repo_name}' in cave '{name}'[/]")
+            raise typer.Exit(1)
 
-        for bare in bare_repos:
-            rn = bare.name[:-4]
-            if repo_name and rn != repo_name:
-                continue
-            workdir = f"/workspace/{rn}"
-            bundle_path = f"/tmp/{rn}.bundle"
+    # Sync any running sessions so the bare repo has the freshest work.
+    running_sessions = [s["session"] for s in list_sessions(d, name) if s["running"]]
+    if session:
+        sessions_to_sync = [session] if session in running_sessions else []
+        if not sessions_to_sync and session not in (s["session"] for s in list_sessions(d, name)):
+            err_console.print(f"[yellow]Session '{session}' not found for cave '{name}'[/]")
+    else:
+        sessions_to_sync = running_sessions
 
-            check = subprocess.run(
-                ["docker", "compose", "exec", COMPOSE_SERVICE, "test", "-d", workdir],
-                cwd=d, capture_output=True,
-            )
-            if check.returncode != 0:
-                continue
-
-            result = subprocess.run(
-                ["docker", "compose", "exec", "-w", workdir, COMPOSE_SERVICE,
-                 "git", "bundle", "create", bundle_path, "--all"],
-                cwd=d, capture_output=True, text=True,
-            )
-            if result.returncode != 0:
-                continue
-
-            host_bundle = d / "repos" / f"{rn}.bundle"
-            subprocess.run(
-                ["docker", "cp", f"{container_id}:{bundle_path}", str(host_bundle)],
-                capture_output=True, text=True,
-            )
-
-            subprocess.run(
-                ["git", "--git-dir", str(bare), "fetch", str(host_bundle),
-                 "+refs/heads/*:refs/heads/*"],
-                capture_output=True, text=True,
-            )
-            host_bundle.unlink(missing_ok=True)
+    for s in sessions_to_sync:
+        _sync_session(d, name, s, bare_repos)
 
     for bare in bare_repos:
         rn = bare.name[:-4]
-        if repo_name and rn != repo_name:
-            continue
 
         source_result = subprocess.run(
             ["git", "--git-dir", str(bare), "config", "jedicave.sourceRepo"],
@@ -1812,19 +2030,39 @@ def fetch(
         if not source_repo or not Path(source_repo).is_dir():
             err_console.print(
                 f"[red]No source repo for '{rn}'.[/] "
-                f"Fetch manually:\n  git fetch {bare}"
+                f"Fetch manually per session:\n"
+                f"  git fetch {bare} '+refs/sessions/<s>/heads/*:refs/remotes/cave/<s>/*'"
             )
             continue
 
-        result = run(
-            ["git", "fetch", str(bare), "+refs/heads/*:refs/remotes/cave/*"],
-            cwd=Path(source_repo), check=False,
-        )
-        if result.returncode != 0:
-            err_console.print(f"[red]Failed to fetch '{rn}'[/]")
+        # Enumerate sessions that have refs in this bare repo. Git refspecs
+        # only allow one '*' per side, so we fetch one session at a time.
+        session_refs = subprocess.run(
+            ["git", "--git-dir", str(bare), "for-each-ref",
+             "--format=%(refname)", "refs/sessions/"],
+            capture_output=True, text=True,
+        ).stdout.strip().splitlines()
+        bare_sessions = sorted({
+            r.split("/", 3)[2] for r in session_refs if r.startswith("refs/sessions/")
+        })
+
+        if not bare_sessions:
+            console.print(f"\n[dim]'{rn}': no harvested sessions yet[/]")
             continue
 
-        # Show what's on cave/ branches
+        any_failed = False
+        for s in bare_sessions:
+            r = run(
+                ["git", "fetch", "--prune", str(bare),
+                 f"+refs/sessions/{s}/heads/*:refs/remotes/cave/{s}/*"],
+                cwd=Path(source_repo), check=False,
+            )
+            if r.returncode != 0:
+                any_failed = True
+        if any_failed:
+            err_console.print(f"[red]Some sessions failed to fetch for '{rn}'[/]")
+            continue
+
         branch_result = subprocess.run(
             ["git", "branch", "-r", "--list", "cave/*", "--format=%(refname:short)"],
             cwd=source_repo, capture_output=True, text=True,
@@ -1833,13 +2071,23 @@ def fetch(
 
         console.print(f"\n[green]Fetched '{rn}'[/] into {source_repo}")
         if branches:
-            console.print(f"  Remote branches:")
+            # Group by session for legibility
+            by_session: dict[str, list[str]] = {}
             for b in branches:
-                console.print(f"    {b}")
+                # b looks like "cave/<session>/<branch>"; the prefix is stripped already
+                short = b[len("cave/"):] if b.startswith("cave/") else b
+                if "/" in short:
+                    s, br = short.split("/", 1)
+                else:
+                    s, br = "default", short
+                by_session.setdefault(s, []).append(br)
+            console.print(f"  Remote branches by session:")
+            for s in sorted(by_session):
+                console.print(f"    [magenta]{s}[/]: {', '.join(sorted(by_session[s]))}")
         console.print(f"\n  Review:")
         console.print(f"    cd {source_repo}")
-        console.print(f"    git log --oneline --graph cave/ --not HEAD")
-        console.print(f"    git diff HEAD..cave/<branch>")
+        console.print(f"    git log --oneline --graph 'cave/*' --not HEAD")
+        console.print(f"    git diff HEAD..cave/<session>/<branch>")
 
 
 @app.command("dir")
@@ -1858,10 +2106,17 @@ def show(
     """Show cave overview."""
     name, d = resolve_cave(name)
 
-    running = is_cave_running(d)
-    status = "[green]running[/]" if running else "[dim]stopped[/]"
+    sess = list_sessions(d, name)
+    running_sessions = [s["session"] for s in sess if s["running"]]
+    status = "[green]running[/]" if running_sessions else "[dim]stopped[/]"
     console.print(f"[cyan]{name}[/]  {status}")
     console.print(f"  Path: {d}")
+
+    if sess:
+        console.print(f"\n  Sessions:")
+        for s in sess:
+            marker = "[green]●[/]" if s["running"] else "[dim]○[/]"
+            console.print(f"    {marker} [magenta]{s['session']}[/]")
 
     # Repos
     repos_dir = d / "repos"
@@ -1962,12 +2217,17 @@ def guide():
 @app.command()
 def logs(
     name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
+    session: Annotated[str, typer.Option("--session", "-s", help="Session name",
+                                          autocompletion=complete_session_name)] = "default",
     follow: Annotated[bool, typer.Option("-f", "--follow", help="Follow log output")] = False,
     tail: Annotated[Optional[int], typer.Option("-n", "--tail", help="Number of lines from end")] = None,
 ):
     """Show cave container logs."""
     name, d = resolve_cave(name)
-    cmd = ["docker", "compose", "--project-directory", str(d), "logs", COMPOSE_SERVICE]
+    project = compose_project(d, name, session)
+    os.environ["JEDI_SESSION"] = session
+    cmd = ["docker", "compose", "-p", project, "--project-directory", str(d),
+           "logs", COMPOSE_SERVICE]
     if follow:
         cmd.append("-f")
     if tail is not None:
