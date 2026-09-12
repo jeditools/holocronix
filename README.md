@@ -41,6 +41,9 @@ This is an early-stage project. Expect rough edges.
 - **Requires**: Projects you want to sandbox should have a `flake.nix`
   that exposes a `devShells` output (or you can use `extraPackages` to
   add tools manually)
+- **Guix backend**: experimental, not wired into `jedi` yet. Baked Rust
+  dependencies work; see `guix/README.md` and the roadmap in
+  `ROADMAP.md`.
 
 ## Naming
 
