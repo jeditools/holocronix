@@ -1,0 +1,10 @@
+[package]
+name = "hello-rust"
+version = "0.1.0"
+edition = "2021"
+
+# Dummy project used to exercise Guix-side cargo vendoring.
+# Two small crates.io deps: one with a build script (anyhow), one without (hex).
+[dependencies]
+anyhow = "1"
+hex = "0.4"
