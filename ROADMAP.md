@@ -16,7 +16,7 @@ usage.
 | Sub-problem | State |
 |-------------|-------|
 | Baked Rust dependencies (crates.io) | Done. `cargo build` works offline in a `guix pack -f docker` image. |
-| Baked Rust dependencies (git sources) | Next. Needed by xous-core, dc34-api, libtropic-rs. |
+| Baked Rust dependencies (git sources) | Done, on a local fixture workspace. Not yet tried on xous-core, dc34-api, or libtropic-rs. |
 | Image config: user, workdir, env, file ownership | Planned. Needs a direct `build-docker-image` call. |
 | Agent tooling packaged for Guix | Planned. |
 | CLI backend selection | Planned. |
@@ -51,11 +51,11 @@ holocronix/
 
 ### Implementation steps
 
-1. **Baked project dependencies** — done for Rust crates.io deps
-   (`cargo-vendor`). Git dependencies next: copy the crate out of its
-   checkout and resolve `workspace = true` manifest fields, as nixpkgs
-   does with `replace-workspace-values.py`. Other ecosystems (npm, uv)
-   later, as needed.
+1. **Baked project dependencies** — done for Rust: crates.io and git
+   sources (`cargo-vendor`), proven on the dummy projects under
+   `examples/`. Next: point it at a real project (libtropic-rs has the
+   simplest git deps; xous-core also needs the rust-xous toolchain).
+   Other ecosystems (npm, uv) later, as needed.
 
 2. **Guix container builder** — write `jedicave.scm`, a Guile function
    that takes a package list and produces a Docker-loadable image.
