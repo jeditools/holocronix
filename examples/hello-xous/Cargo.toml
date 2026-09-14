@@ -1,0 +1,10 @@
+[package]
+name = "hello-xous"
+version = "0.1.0"
+edition = "2021"
+
+# Dummy project exercising the Xous cross toolchain from baobit inside a
+# Guix-built image: std hello world for riscv32imac-unknown-xous-elf, plus
+# one crates.io dependency so cargo-vendor is exercised on a cross build.
+[dependencies]
+hex = "0.4"
