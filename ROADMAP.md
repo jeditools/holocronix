@@ -17,6 +17,7 @@ usage.
 |-------------|-------|
 | Baked Rust dependencies (crates.io) | Done. `cargo build` works offline in a `guix pack -f docker` image. |
 | Baked Rust dependencies (git sources) | Done, on a local fixture workspace. Not yet tried on xous-core, dc34-api, or libtropic-rs. |
+| Xous cross toolchain in the image | Done. baobit's `rust-xous-toolchain` via load path under baobit's pinned Guix; std hello world cross-compiles offline. Channel form blocked by baobit's broken channel auth. |
 | Image config: user, workdir, env, file ownership | Planned. Needs a direct `build-docker-image` call. |
 | Agent tooling packaged for Guix | Planned. |
 | CLI backend selection | Planned. |

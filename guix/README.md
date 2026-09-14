@@ -132,6 +132,67 @@ cd examples/hello-rust-git && guix shell rust rust:cargo nss-certs -- \
 If the fixture already exists at that path from an older version, move it
 away first; the script does not overwrite.
 
+## Sub-problem 2: Xous cross toolchain in the image
+
+Goal: an image that cross-compiles for `riscv32imac-unknown-xous-elf`
+offline, so a xous-core cave can build without the host's toolchain.
+
+Nothing new is packaged here. baobit already provides
+`rust-xous-toolchain`: a pinned Rust with a merged sysroot carrying the host
+target, `riscv32imac-unknown-xous-elf`, and `riscv32imac-unknown-none-elf`,
+plus wrappers for rustc, cargo, cc, and rust-lld. The image just includes
+that package, built under the Guix commit baobit pins so the derivation
+matches what baobit's CI and substitute server (guix.baobit.one) produce.
+
+baobit is consumed as a load path, the way its own Makefile does, not as a
+channel: baobit's channel authentication is currently broken on main (see
+`note-channel-auth-broken.md` in baobit), so a `(channel (name 'baobit) ...)`
+pin would fail to authenticate. Switch to the channel form once that is
+fixed.
+
+`examples/hello-xous/` is a std hello world for the Xous target with one
+crates.io dependency, so vendoring is exercised on a cross build too.
+
+With `BAOBIT` pointing at a baobit checkout:
+
+```sh
+mkdir -p /tmp/hello-xous-target
+guix time-machine -C $BAOBIT/channels/guix.scm -- \
+  shell -C --pure -L guix -L $BAOBIT/packages -m examples/hello-xous/manifest.scm \
+  --expose=$PWD/examples/hello-xous=/workspace/hello-xous \
+  --share=/tmp/hello-xous-target=/tmp/target \
+  -- sh -c 'cd /workspace/hello-xous && HOME=/tmp CARGO_TARGET_DIR=/tmp/target \
+       cargo build --locked --target riscv32imac-unknown-xous-elf \
+         --config $GUIX_ENVIRONMENT/share/cargo-config/config.toml'
+```
+
+The result cannot run on the host. Check it is a RISC-V ELF instead:
+
+```sh
+od -A x -t x1z -N 20 /tmp/hello-xous-target/riscv32imac-unknown-xous-elf/debug/hello-xous
+# 7f 45 4c 46 01 ... at 0, and f3 00 (EM_RISCV) at offset 0x12
+```
+
+Docker image, same flags as the other examples but under `time-machine`:
+
+```sh
+guix time-machine -C $BAOBIT/channels/guix.scm -- \
+  pack -L guix -L $BAOBIT/packages -f docker -m examples/hello-xous/manifest.scm \
+  -S /bin=bin -S /.cargo=share/cargo-config \
+  --entry-point=bin/bash --image-tag=hello-xous-cave
+docker load < result
+docker run --rm --network none \
+  -v $PWD/examples/hello-xous:/workspace/hello-xous:ro \
+  -e HOME=/tmp -e CARGO_TARGET_DIR=/tmp/target -w /workspace/hello-xous \
+  hello-xous-cave:latest -c 'cargo build --locked --target riscv32imac-unknown-xous-elf'
+```
+
+If the toolchain is not in your store or on guix.baobit.one, the first build
+compiles the Xous sysroot from the betrusted-io Rust fork, which takes a
+long time. `guix time-machine -C $BAOBIT/channels/guix.scm -- build -L
+$BAOBIT/packages --dry-run -e '(@ (rust-xous-toolchain) rust-xous-toolchain)'`
+tells you beforehand.
+
 ### Known limits
 
 - **Same crate from two git sources.** xous-core's lockfile lists `com_rs`
