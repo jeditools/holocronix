@@ -1,0 +1,12 @@
+[package]
+name = "hello-rust-git"
+version = "0.1.0"
+edition = "2021"
+
+# Dummy project exercising git dependency vendoring.  `greeter` lives in a
+# git workspace with workspace-inherited fields and a path dependency on
+# `greeter-core`; see examples/fixtures/greeter.  The repository is a local
+# fixture at a fixed path, materialized by setup-fixture.sh.
+[dependencies]
+anyhow = "1"
+greeter = { git = "file:///tmp/holocronix-fixtures/greeter", branch = "main" }

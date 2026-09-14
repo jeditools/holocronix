@@ -1,0 +1,9 @@
+[package]
+name = "greeter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+greeter-core = { workspace = true }
+hex = { workspace = true }

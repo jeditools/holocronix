@@ -1,0 +1,19 @@
+# Test fixture: a cargo workspace served as a git dependency by
+# examples/hello-rust-git.  It exercises the two things that make vendoring
+# git crates hard: workspace-inherited manifest fields ([workspace.package],
+# [workspace.dependencies]) and a path dependency between members.
+#
+# This directory is plain files.  examples/hello-rust-git/setup-fixture.sh
+# turns it into a git repository with a fixed commit hash.
+[workspace]
+resolver = "2"
+members = ["greeter", "greeter-core"]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+greeter-core = { path = "greeter-core", version = "0.3.0" }
+hex = "0.4"
