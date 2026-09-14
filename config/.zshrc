@@ -7,7 +7,8 @@ export PATH="$HOME/.local/bin:$PATH"
 # Oh My Zsh ($ZSH env var is set by the container environment)
 ZSH_THEME="robbyrussell"
 plugins=(git)
-source "$ZSH/oh-my-zsh.sh"
+# oh-my-zsh is present in the Nix image; the Guix image has no package for it yet.
+[ -n "$ZSH" ] && [ -f "$ZSH/oh-my-zsh.sh" ] && source "$ZSH/oh-my-zsh.sh"
 
 # History settings
 export HISTFILE=/commandhistory/.zsh_history
