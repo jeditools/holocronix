@@ -193,6 +193,69 @@ long time. `guix time-machine -C $BAOBIT/channels/guix.scm -- build -L
 $BAOBIT/packages --dry-run -e '(@ (rust-xous-toolchain) rust-xous-toolchain)'`
 tells you beforehand.
 
+## Sub-problem 3: the image builder
+
+Goal: a real jedicave image, not a bare `guix pack` profile: user `yoda`
+(uid 1000), `/workspace` as working directory, a writable home with the
+shell and git config, the volume mount points owned by the agent, root-only
+infrastructure tools, the entrypoint, and the environment variables the Nix
+image sets.
+
+Module: `holocronix/jedicave.scm`, exporting `jedicave-image`, the Guix
+counterpart of `lib/mkJediCave.nix`. It evaluates to the Docker image
+tarball, so a cave definition is a file returning it:
+
+```scheme
+(use-modules (holocronix jedicave) (holocronix cargo-vendor) (gnu packages))
+(jedicave-image
+ #:name "hello-rust-jedicave"
+ #:extra-packages (append (specifications->packages '("rust" "rust:cargo"))
+                          (list (cargo-vendor "hello-rust" "/path/to/Cargo.lock")))
+ #:symlinks '(("/.cargo" . "share/cargo-config")))
+```
+
+`examples/hello-rust/cave.scm` is exactly that. Options mirror `mkJediCave`:
+`#:packages` (defaults to `%jedicave-base-specs`, the Nix tool list under
+Guix names), `#:extra-packages`, `#:infra-packages`, `#:env`, `#:symlinks`,
+`#:user`/`#:uid`/`#:gid`, `#:git-user`/`#:git-email`, `#:claude?` and
+`#:claude-settings`, `#:project-setup`, `#:extra-directives`, `#:max-layers`.
+
+Why `guix pack` is not enough: its docker format only writes `Env` and
+`Entrypoint` into the image config, and it archives every file as root, so
+there is no way to give the agent a writable home. `holocronix/docker.scm`
+is a fork of Guix's `guix/docker.scm` (GPLv3, same as this repo) with three
+additions: `#:user` and `#:working-dir` in the config, `#:owners` to archive
+chosen subtrees of the non-store layer under another uid/gid, and modes kept
+as the populate directives set them. The store layers are untouched and
+still split with `--max-layers`, so images share layers like
+`buildLayeredImage` output does.
+
+The entrypoint is a port of the Nix `jedicave-start` script: first-boot
+setup, proxy CA injection, cloning bare repos from `/repos` into
+`/workspace` with every seeded branch materialized, project setup, then
+`sleep infinity`. Claude Code seeding is present but off until the agent is
+packaged.
+
+### Try it
+
+```sh
+guix build -L guix -f examples/hello-rust/cave.scm        # prints the tarball path
+docker load < /gnu/store/...-hello-rust-jedicave-docker-image.tar.gz
+
+docker run -d --name hello --network none \
+  -v $PWD/examples/hello-rust:/src/hello-rust:ro hello-rust-jedicave:latest
+docker logs hello                       # [jedicave] First-boot setup... Setup complete.
+docker exec hello sh -c 'id; pwd; ls -ld /home/yoda /workspace /usr/local/sbin'
+docker exec hello sh -c 'cp -r /src/hello-rust /workspace/ && cd /workspace/hello-rust \
+  && cargo build --locked && ./target/debug/hello-rust'
+docker rm -f hello
+```
+
+Expected: `uid=1000(yoda)`, `/workspace`, home and workspace owned by yoda,
+`/usr/local/sbin` unreadable to yoda, and the build succeeds with no network.
+Compressed tarball is about 900 MB; the loaded image about 6 GB, since the
+base set includes gcc-toolchain, python, node, and rust.
+
 ### Known limits
 
 - **Same crate from two git sources.** xous-core's lockfile lists `com_rs`
@@ -205,6 +268,8 @@ tells you beforehand.
   are rejected.
 - **Lockfile v1** (checksums under `[metadata]`) is not parsed; v2 through v4
   are.
-- Image config beyond what `guix pack` offers: user, working dir, arbitrary
-  env vars. Those need a custom call to `build-docker-image` from
-  `(guix docker)`, which is the next sub-problem.
+- **No oh-my-zsh.** Guix has no package for it; `.zshrc` skips it when
+  absent. The Claude plugin seed directory and settings are not baked yet
+  either, pending agent packaging.
+- **Not wired into `jedi`.** `jedi build` still runs `nix build`; a cave with
+  a `cave.scm` needs the `guix build -f` and `docker load` steps by hand.

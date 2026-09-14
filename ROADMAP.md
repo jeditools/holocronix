@@ -18,7 +18,7 @@ usage.
 | Baked Rust dependencies (crates.io) | Done. `cargo build` works offline in a `guix pack -f docker` image. |
 | Baked Rust dependencies (git sources) | Done, on a local fixture workspace. Not yet tried on xous-core, dc34-api, or libtropic-rs. |
 | Xous cross toolchain in the image | Done. baobit's `rust-xous-toolchain` via load path under baobit's pinned Guix; std hello world cross-compiles offline. Channel form blocked by baobit's broken channel auth. |
-| Image config: user, workdir, env, file ownership | Planned. Needs a direct `build-docker-image` call. |
+| Image config: user, workdir, env, file ownership | Done. `jedicave-image` in `guix/holocronix/jedicave.scm` on a forked docker builder with `#:user`, `#:working-dir`, `#:owners`. Verified on `examples/hello-rust/cave.scm`. |
 | Agent tooling packaged for Guix | Planned. |
 | CLI backend selection | Planned. |
 
@@ -34,8 +34,9 @@ holocronix/
 │   ├── README.md
 │   └── holocronix/
 │       ├── cargo-vendor.scm  ← baked Rust deps (done)
-│       └── jedicave.scm      ← image builder (planned)
-└── examples/hello-rust/      ← end-to-end Guix example
+│       ├── docker.scm        ← fork of (guix docker): user, workdir, owners
+│       └── jedicave.scm      ← image builder, Guix mkJediCave (done)
+└── examples/                 ← hello-rust, hello-rust-git, hello-xous
 ```
 
 ### Mapping
@@ -81,16 +82,6 @@ holocronix/
 
 ### Known challenges
 
-- **Root-owned image contents** — Guix's docker builder tars every
-  layer with owner 0:0, so there is no equivalent of the
-  `chown -R 1000:1000` in `fakeRootCommands`. Plan: start the
-  entrypoint as root, chown the writable dirs, drop to uid 1000 with
-  `setpriv`.
-
-- **Image config** — `(guix docker)` only emits `Env` and `Entrypoint`.
-  `User` and `WorkingDir` can come from compose; arbitrary env needs
-  the direct `build-docker-image` call from step 2.
-
 - **Package coverage** — nixpkgs is larger. Agent tooling must be
   packaged for Guix. oh-my-zsh is missing but trivial. systemd
   headers do not exist on Guix; projects needing libudev or sd-bus
@@ -104,6 +95,10 @@ holocronix/
   plugin repos need a lock of commit plus hash, unlike unlocked
   flake inputs.
 
-Resolved: layered images. `guix pack -f docker` and
-`build-docker-image` support `--max-layers`, so incremental rebuilds
-are comparable to `buildLayeredImage`.
+Resolved:
+
+- Layered images: `build-docker-image` supports `--max-layers`, so
+  incremental rebuilds are comparable to `buildLayeredImage`.
+- Root-owned image contents and missing `User`/`WorkingDir`: handled by
+  the `(holocronix docker)` fork, which archives chosen subtrees under
+  the agent's uid and writes both config keys.
