@@ -31,7 +31,8 @@ This document describes what the jedicave isolates, what it does not, and where 
 | Read-only root filesystem | Prevents persistent container modifications |
 | Cloud metadata blocking | Prevents IAM credential leaks on cloud hosts |
 | User namespace remapping | Maps container root to unprivileged host UID |
-| gVisor / Kata Containers | Kernel-level isolation without full VMs |
+| Default-deny egress | Drops non-proxy ports on allowlisted IPs, blocks private ranges |
+| gVisor, Kata Containers, or a microVM runtime | Separate kernel from the host; see [RELATED-WORK.md](RELATED-WORK.md) |
 | Volume integrity checks | Detects tampering between sessions |
 | Audit logging | Supports post-incident analysis |
 
@@ -62,7 +63,12 @@ The firewall is enabled by default, restricting outbound access to allowlisted d
 - **DNS tunneling (in `open` mode).** By default (`dns.mode: open` in `policy.yaml`), DNS queries resolve for all domains. A malicious process could use DNS tunneling to exfiltrate data. Set `dns.mode: synthetic` to run a CoreDNS sidecar that only resolves allowlisted domains (everything else returns NXDOMAIN), or `dns.mode: trusted` to redirect DNS to specific resolvers via iptables DNAT.
 - **Exfiltration via allowed domains.** Data can be exfiltrated through any allowlisted endpoint. For example, if `github.com` is allowed, a process could push data to an attacker-controlled repository.
 - **IP-based bypass.** The iptables rules use domain names, which are resolved to IPs at rule-creation time. If a domain resolves to multiple IPs or changes its DNS records after rules are applied, traffic may be allowed or blocked unexpectedly.
+- **Every port on an allowlisted IP.** An allowlist entry becomes `iptables -A OUTPUT -d <ip> -j ACCEPT` with no protocol or port match, so it admits SSH, UDP, or any custom service on that IP, not just HTTPS. With the L7 proxy enabled, only ports 80 and 443 are forced through the proxy; other ports on allowlisted IPs still bypass HTTP-level policy, hooks, and secret handling. Compare Gondolin's userspace network stack, which drops any TCP flow it cannot classify as HTTP, TLS, SSH, or an explicit mapping (see [RELATED-WORK.md](RELATED-WORK.md)).
 - **Cloud metadata services.** On cloud instances (AWS, GCP, Azure), the instance metadata endpoint (`169.254.169.254`) is reachable from inside the container by default. This can leak IAM credentials, instance identity tokens, and other sensitive data. The default firewall rules do not block this endpoint.
+
+### Secrets
+
+`policy.yaml` supports two injection modes. In `env` mode (the default) the real value is resolved on the host and passed into the shell container's environment, where any process, including code the agent runs, can read it and send it to any allowlisted endpoint. In `proxy` mode the container only sees a placeholder; the real value lives in the proxy sidecar and is substituted into matching headers for the configured domains, so the secret never enters the agent's environment. Proxy mode requires `proxy.enabled: true` and is the mode to prefer for anything beyond the LLM API key.
 
 ### Docker socket
 
@@ -125,7 +131,7 @@ The **container is the trust boundary**. Everything inside it — workspace file
 
 ### What the container does NOT defend against
 
-- **Container escapes.** A kernel exploit or Docker runtime vulnerability can break out of the namespace boundary. The seccomp profile reduces the kernel attack surface (e.g., blocking AF_ALG for CVE-2026-31431), but full mitigation requires a separate kernel (VM) via gVisor or Kata Containers.
+- **Container escapes.** A kernel exploit or Docker runtime vulnerability can break out of the namespace boundary. The seccomp profile reduces the kernel attack surface (e.g., blocking AF_ALG for CVE-2026-31431), but full mitigation requires a separate kernel (VM) via gVisor, Kata Containers, or a microVM runtime such as Gondolin (see [RELATED-WORK.md](RELATED-WORK.md)).
 - **Compromising the trusted tool chain.** If the Nix cache, Claude's install script, or Oh My Zsh is compromised at build/setup time, the container starts in a compromised state.
 - **Persistent volume poisoning.** Malicious code can write to named volumes (Claude config, shell history) that survive rebuilds, establishing persistence across sessions.
 - **Data exfiltration via allowed channels.** Even with the firewall enabled, data can leave through DNS, allowed domains, or timing side-channels. The container reduces the surface but cannot eliminate covert channels.
@@ -172,6 +178,17 @@ Run the container with `read_only: true` and use tmpfs mounts for writable paths
 
 Set `network.dns.mode: synthetic` in `policy.yaml` to deploy a CoreDNS sidecar that only resolves allowlisted domains (returns NXDOMAIN for everything else). This closes the DNS tunneling gap. Alternatively, `dns.mode: trusted` redirects DNS to specified resolvers via iptables DNAT — lighter, but does not prevent tunneling.
 
+### Default-deny egress
+
+Tighten the generated firewall so an allowlist entry admits only what the policy actually needs:
+
+- When the L7 proxy is enabled, accept only the proxy IP and DNS, and drop everything else. Today allowlisted IPs are still accepted on every port, so only 80 and 443 are actually mediated.
+- Without the proxy, match allowlist rules on `-p tcp --dport 443` (plus 80 or 22 where a domain needs them) instead of accepting all protocols and ports.
+- Block RFC 1918 and link-local ranges by default, so an allowlisted public domain that resolves to a private address cannot reach LAN services.
+- Default `dns.mode` to `synthetic` rather than `open`.
+
+This is the iptables approximation of what Gondolin gets by construction from its userspace network stack (see [RELATED-WORK.md](RELATED-WORK.md)).
+
 ### Cloud metadata blocking
 
 Add an iptables rule to block access to `169.254.169.254` (and its IPv6 equivalent) by default when the firewall is enabled:
@@ -184,9 +201,11 @@ iptables -A OUTPUT -d 169.254.169.254 -j DROP
 
 Enable Docker user namespace remapping so that UID 0 inside the container maps to an unprivileged UID on the host. This mitigates container escapes that rely on the container root being actual host root.
 
-### gVisor or Kata Containers
+### gVisor, Kata Containers, or a microVM runtime
 
-Replace the default runc runtime with [gVisor](https://gvisor.dev/) (application kernel) or [Kata Containers](https://katacontainers.io/) (lightweight VMs). These provide a stronger isolation boundary than Linux namespaces alone by intercepting syscalls before they reach the host kernel.
+Replace the default runc runtime with [gVisor](https://gvisor.dev/) (application kernel) or [Kata Containers](https://katacontainers.io/) (lightweight VMs). These provide a stronger isolation boundary than Linux namespaces alone by intercepting syscalls before they reach the host kernel. Both are pluggable Docker runtimes, so they are a `runtime:` line in `compose.yml` and do not touch the image build.
+
+A third option is [Gondolin](https://github.com/earendil-works/gondolin), the QEMU microVM library behind `vmpi`. It gives a hardware boundary like Kata, but also replaces the guest's network path with a host-side userspace stack that classifies every flow (HTTP parsed, TLS intercepted, unknown TCP and all non-DNS UDP dropped) and substitutes secrets only into requests bound for their allowed hosts. Its image builder can take an OCI image as the rootfs, so a Nix- or Guix-built jedicave could run under it unchanged. It is not a Docker runtime, so it would replace the compose layer rather than plug into it. Trade-offs and a spike plan are in [RELATED-WORK.md](RELATED-WORK.md) and [ROADMAP.md](ROADMAP.md).
 
 ### Volume integrity
 

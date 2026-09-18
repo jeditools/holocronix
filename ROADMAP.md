@@ -102,3 +102,67 @@ Resolved:
 - Root-owned image contents and missing `User`/`WorkingDir`: handled by
   the `(holocronix docker)` fork, which archives chosen subtrees under
   the agent's uid and writes both config keys.
+
+## Runtime isolation
+
+The cave image is only as isolated as the runtime that executes it.
+Today that is Docker with runc: Linux namespaces, a seccomp profile,
+and the host kernel. `SECURITY.md` lists what that does and does not
+protect. The image is plain OCI, so the runtime is a pluggable choice
+that leaves the Nix and Guix baking layers untouched.
+
+`RELATED-WORK.md` compares the current design with `vmpi`, a QEMU
+microVM sandbox built on Gondolin. The short version: it wins on the
+isolation boundary and on network policy, we win on reproducible
+images, baked toolchains, and the git handoff. The two compose.
+
+### Status
+
+| Item | State |
+|------|-------|
+| gVisor or Kata via `runtime:` in `compose.yml` | Not started. Drop-in for the compose layer. |
+| Gondolin as a microVM backend | Evaluated. Spike planned, see below. |
+| Default-deny egress in `policy.yaml` | Planned. See `SECURITY.md`, "Default-deny egress". |
+| Secrets default to proxy mode | Planned. |
+| cgroup limits in `compose.yml` | Planned. See `SECURITY.md`, "Resource limits". |
+
+### Gondolin spike
+
+Goal: boot an unmodified jedicave OCI image under Gondolin and see
+whether the cave workflow survives. Questions to answer, in order:
+
+1. **Does it boot?** Gondolin's image builder accepts an OCI image as
+   the rootfs source (`oci` in the build config); Alpine still supplies
+   the kernel and initramfs, and the rootfs needs `/bin/sh`. Confirm the
+   builder injects its guest daemons (`sandboxd`, `sandboxfs`) into a
+   non-Alpine rootfs, and that a multi-GB Nix or Guix closure fits the
+   ext4 sizing (`rootfs.sizeMb`).
+2. **Where does `/workspace` live?** Gondolin mounts host directories
+   over FUSE with a 60 KiB per-operation payload cap, which is the wrong
+   place for a cargo target directory. Keep `/workspace` on the guest
+   disk, expose `repos/` through a read-only provider, and keep the
+   bare-repo clone and harvest flow as is. Measure `cargo build` on
+   `examples/hello-rust` against the Docker cave.
+3. **Does the policy map?** `policy.yaml` domains become Gondolin
+   `allowedHosts`; proxy-mode secrets become Gondolin secrets with the
+   same placeholder semantics; `hooks` become `onRequest`/`onResponse`.
+   The iptables and mitmproxy sidecars disappear.
+4. **What is lost?** Long-running caves with `jedi enter`, `docker exec`
+   as root for firewall changes, named volumes, HTTP/2. Decide whether a
+   Gondolin cave is a second cave type or a `--runtime` flag.
+
+Not on the table: adopting `vmpi` itself. It is a thin, `pi`-only
+wrapper; everything of interest is in Gondolin.
+
+### Policy hardening borrowed from Gondolin
+
+Cheap changes to the generated firewall and policy that close gaps the
+comparison surfaced, without changing runtimes. Details under
+"Default-deny egress" in `SECURITY.md`:
+
+- accept only the proxy IP and DNS when the proxy is on, instead of
+  every port on every allowlisted IP;
+- match allowlist rules on port, not just destination IP;
+- block private and link-local ranges plus the cloud metadata address;
+- default `dns.mode` to `synthetic`;
+- default secrets to `inject: proxy`.
