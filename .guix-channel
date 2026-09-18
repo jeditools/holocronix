@@ -1,0 +1,6 @@
+;; Makes this repository usable as a Guix channel: the (holocronix ...)
+;; modules live under guix/.  A cave's channels.scm pins holocronix this way,
+;; the Guix counterpart of the flake's holocronix input.
+(channel
+ (version 0)
+ (directory "guix"))
