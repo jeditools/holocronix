@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import socket
+import re
 import subprocess
 from datetime import datetime
 from enum import Enum
@@ -66,8 +67,104 @@ def _list_caves() -> list[str]:
         return []
     return sorted(
         d.name for d in CAVES_DIR.iterdir()
-        if d.is_dir() and (d / "flake.nix").exists()
+        if d.is_dir() and ((d / "flake.nix").exists() or (d / "cave.scm").exists())
     )
+
+
+# --- Backends ---
+#
+# A cave is Nix-backed when defined by flake.nix, Guix-backed when defined by
+# cave.scm.  Everything past `jedi build` (compose, firewall, seed, harvest)
+# is backend-agnostic: both produce a jedicave:latest image for Docker.
+
+def cave_backend(d: Path) -> str:
+    """'guix' when the cave is defined by cave.scm, else 'nix'."""
+    return "guix" if (d / "cave.scm").exists() else "nix"
+
+
+def _holocronix_dir() -> Path | None:
+    """Local holocronix checkout, if known: HOLOCRONIX_DIR, or a path:
+    HOLOCRONIX_URL (which the holocronix devShell sets)."""
+    explicit = os.environ.get("HOLOCRONIX_DIR")
+    if explicit:
+        return Path(explicit)
+    url = os.environ.get("HOLOCRONIX_URL", "")
+    if url.startswith("path:"):
+        return Path(url[len("path:"):])
+    return None
+
+
+def _holocronix_channel_url(url: str) -> str:
+    """Turn a flake-style holocronix URL into a git URL usable as a Guix channel."""
+    if url.startswith("path:"):
+        return url[len("path:"):]
+    if url.startswith("github:"):
+        owner, repo = url[len("github:"):].split("/")[:2]
+        return f"https://github.com/{owner}/{repo}"
+    if url.startswith("git+"):
+        return url[len("git+"):].split("?")[0]
+    return url
+
+
+def _guix_load_path_args() -> list[str]:
+    """-L for the local holocronix checkout, so its working tree takes
+    precedence over the holocronix channel pinned in channels.scm."""
+    d = _holocronix_dir()
+    return ["-L", str(d / "guix")] if d and (d / "guix").is_dir() else []
+
+
+def _guix_cmd(d: Path, *args: str) -> list[str]:
+    """A guix command line, under time-machine when the cave pins channels."""
+    cmd = ["guix"]
+    if (d / "channels.scm").exists():
+        cmd += ["time-machine", "-C", "channels.scm", "--"]
+    return cmd + list(args)
+
+
+def _channels_holocronix_url(d: Path) -> str | None:
+    """The holocronix channel URL recorded in the cave's channels.scm."""
+    f = d / "channels.scm"
+    if not f.exists():
+        return None
+    m = re.search(r"\(name 'holocronix\)\s*\(url \"([^\"]+)\"\)", f.read_text())
+    return m.group(1) if m else None
+
+
+def _write_guix_channels(d: Path, name: str, holocronix_url: str) -> None:
+    """Write channels.scm: holocronix, pinned to the checkout's HEAD when it is
+    a local git repository, plus the channels of the current `guix describe`."""
+    result = subprocess.run(["guix", "describe", "-f", "channels"],
+                            capture_output=True, text=True)
+    if result.returncode != 0:
+        err_console.print(f"[red]guix describe failed:[/]\n{result.stderr.strip()}")
+        raise typer.Exit(1)
+    pin = ""
+    if Path(holocronix_url).is_dir():
+        head = subprocess.run(["git", "-C", holocronix_url, "rev-parse", "HEAD"],
+                              capture_output=True, text=True)
+        if head.returncode == 0:
+            pin = f'\n        (commit "{head.stdout.strip()}")'
+    (d / "channels.scm").write_text(CHANNELS_TEMPLATE.format(
+        name=name, url=holocronix_url, pin=pin, describe=result.stdout.strip()))
+
+
+def _print_guix_channels(name: str, d: Path) -> None:
+    f = d / "channels.scm"
+    if not f.exists():
+        console.print(f"Cave '{name}' has no channels.scm; it builds with the guix on PATH")
+        return
+    text = f.read_text()
+    table = Table(title=f"Channels for cave '{name}'")
+    table.add_column("Channel", style="cyan")
+    table.add_column("URL")
+    table.add_column("Branch", style="dim")
+    table.add_column("Commit", style="dim")
+    names = list(re.finditer(r"\(name '([\w-]+)\)", text))
+    for i, m in enumerate(names):
+        block = text[m.end():names[i + 1].start() if i + 1 < len(names) else len(text)]
+        field = lambda key: (re.search(rf'\({key} "([^"]+)"\)', block) or [None, ""])[1]
+        table.add_row(m.group(1), field("url"), field("branch"), field("commit")[:12])
+    console.print(table)
 
 
 def complete_cave_name(incomplete: str) -> list[str]:
@@ -360,9 +457,12 @@ def firewall_commands(d: Path) -> str:
     return " && ".join(cmds)
 
 
-def check_deps() -> None:
+def check_deps(backend: str = "nix") -> None:
     missing = []
-    if not shutil.which("nix"):
+    if backend == "guix":
+        if not shutil.which("guix"):
+            missing.append("guix (https://guix.gnu.org/download/)")
+    elif not shutil.which("nix"):
         missing.append("nix (https://nixos.org/download/)")
     if not shutil.which("docker"):
         missing.append("docker")
@@ -429,6 +529,67 @@ FLAKE_TEMPLATE = """\
     }};
   }};
 }}
+"""
+
+CAVE_SCM_TEMPLATE = """\
+;; Jedicave: {name}  (Guix backend)
+;;
+;; Edit the package list below, then build:
+;;   jedi build {name}
+;;
+;; `jedi build` evaluates this file with `guix build -f cave.scm`, under the
+;; channels pinned in channels.scm, and loads the resulting image into
+;; Docker.  It must return the image, which `jedicave-image` does.  See
+;; guix/README.md in holocronix for the full option list.
+
+(use-modules (holocronix jedicave)
+             (holocronix cargo-vendor)
+             (gnu packages))
+
+(jedicave-image
+ ;; Keep "jedicave": compose.yml expects the image tag jedicave:latest.
+ #:name "jedicave"
+
+ ;; Project toolchain, added to the jedicave base tools
+ ;; (%jedicave-base-specs).  Package specs as `guix install` takes them.
+ #:extra-packages
+ (append
+  (specifications->packages
+   '(;; "rust" "rust:cargo"
+     ;; "go" "gopls"
+     ))
+  ;; Baked Rust dependencies: every crate in a Cargo.lock, so cargo builds
+  ;; offline.  Point at the project's lockfile (one project per cave):
+  (list
+   ;; (cargo-vendor "my-project" "/home/yoda/code/my-project/Cargo.lock")
+   ))
+
+ ;; With cargo-vendor above, put its config at / so cargo finds it:
+ ;; #:symlinks '(("/.cargo" . "share/cargo-config"))
+
+ ;; Extra environment variables:
+ ;; #:env '(("CARGO_ALIAS_XTASK" . "run --package xtask --"))
+ )
+"""
+
+CHANNELS_TEMPLATE = """\
+;; Channels for jedicave {name}.
+;;
+;; `jedi build` runs `guix time-machine -C channels.scm -- build ...`, so the
+;; image is built with exactly these commits: the Guix counterpart of
+;; flake.lock.  `jedi update` re-pins to the current `guix describe` and to
+;; the holocronix checkout's HEAD.  Delete this file to build with whatever
+;; `guix` is on PATH instead.
+;;
+;; Add other channels (a project's own, baobit, ...) to the first list.
+
+(append
+ (list (channel
+        (name 'holocronix)
+        (url "{url}")
+        (branch "main"){pin}))
+ ;; Pinned from `guix describe -f channels`:
+ {describe})
 """
 
 POLICY_DEFAULTS = """\
@@ -894,27 +1055,42 @@ def _write_compose(d: Path, name: str, policy: dict) -> None:
 @app.command()
 def init(
     name: Annotated[str, typer.Argument(help="Cave name", autocompletion=complete_cave_name)],
-    holocronix_url: Annotated[Optional[str], typer.Option(help="Holocronix flake URL")] = None,
+    holocronix_url: Annotated[Optional[str], typer.Option(help="Holocronix flake URL (or git URL / path for --backend guix)")] = None,
+    backend: Annotated[str, typer.Option("--backend", "-b", help="Image backend: nix (default) or guix")] = "nix",
 ):
     """Create a new cave."""
+    if backend not in ("nix", "guix"):
+        err_console.print(f"[red]Unknown backend '{backend}'[/] (expected nix or guix)")
+        raise typer.Exit(1)
     d = cave_dir(name)
 
-    if d.exists() and (d / "flake.nix").exists():
+    if d.exists() and ((d / "flake.nix").exists() or (d / "cave.scm").exists()):
         err_console.print(f"[red]Cave '{name}' already exists at {d}[/]")
         raise typer.Exit(1)
+
+    if backend == "guix":
+        check_deps("guix")
 
     d.mkdir(parents=True, exist_ok=True)
     (d / "repos").mkdir(exist_ok=True)
 
     url = holocronix_url or os.environ.get("HOLOCRONIX_URL", HOLOCRONIX_URL_DEFAULT)
 
-    (d / "flake.nix").write_text(FLAKE_TEMPLATE.format(name=name, holocronix_url=url))
+    if backend == "guix":
+        (d / "cave.scm").write_text(CAVE_SCM_TEMPLATE.format(name=name))
+        _write_guix_channels(d, name, _holocronix_channel_url(url))
+        cave_file = "cave.scm"
+        edit_hint = "add your project's packages"
+    else:
+        (d / "flake.nix").write_text(FLAKE_TEMPLATE.format(name=name, holocronix_url=url))
+        cave_file = "flake.nix"
+        edit_hint = "add your project inputs and devShells"
     (d / "policy.yaml").write_text(POLICY_DEFAULTS)
     _write_compose(d, name, _load_policy(d))
 
-    console.print(f"[green]Cave '{name}' created at {d}[/]")
+    console.print(f"[green]Cave '{name}' created at {d}[/] ({backend} backend)")
     console.print("Next steps:")
-    console.print(f"  1. Edit {d / 'flake.nix'} — add your project inputs and devShells")
+    console.print(f"  1. Edit {d / cave_file} — {edit_hint}")
     console.print(f"  2. Seed your project: jedi seed <repo-path> {name}")
     console.print(f"  3. Run: jedi build {name}")
     console.print()
@@ -929,9 +1105,12 @@ def init(
 def inputs(
     name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
 ):
-    """List flake inputs and their locked revisions."""
-    check_deps()
+    """List flake inputs (or Guix channels) and their locked revisions."""
     name, d = resolve_cave(name)
+    if cave_backend(d) == "guix":
+        _print_guix_channels(name, d)
+        return
+    check_deps()
     result = subprocess.run(
         ["nix", "flake", "metadata", "--json", "."],
         cwd=d, capture_output=True, text=True
@@ -978,9 +1157,21 @@ def update(
     name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
     input: Annotated[Optional[str], typer.Option("--input", "-i", help="Specific input to update (default: all)")] = None,
 ):
-    """Update flake inputs (lock only, no build)."""
-    check_deps()
+    """Update flake inputs or re-pin Guix channels (lock only, no build)."""
     name, d = resolve_cave(name)
+    if cave_backend(d) == "guix":
+        if input:
+            err_console.print("[red]--input is not supported for Guix caves;[/] "
+                              "jedi update re-pins every channel")
+            raise typer.Exit(1)
+        check_deps("guix")
+        url = _channels_holocronix_url(d) or _holocronix_channel_url(
+            os.environ.get("HOLOCRONIX_URL", HOLOCRONIX_URL_DEFAULT))
+        console.print("Re-pinning channels from `guix describe`...")
+        _write_guix_channels(d, name, url)
+        console.print(f"[green]channels.scm updated for cave '{name}'[/]")
+        return
+    check_deps()
 
     if input:
         console.print(f"Updating input [cyan]{input}[/]...")
@@ -1000,15 +1191,36 @@ def build(
     update: Annotated[bool, typer.Option("--update", "-u", help="Update all flake inputs before building")] = False,
 ):
     """Build cave image."""
-    check_deps()
     name, d = resolve_cave(name)
+    backend = cave_backend(d)
+    check_deps(backend)
 
-    if update:
-        console.print("Updating all inputs...")
-        run(["nix", "flake", "update"], cwd=d)
-
-    console.print(f"Building cave [cyan]{name}[/]...")
-    run(["nix", "build", ".#container", "--print-build-logs"], cwd=d)
+    if backend == "guix":
+        if update:
+            url = _channels_holocronix_url(d) or _holocronix_channel_url(
+                os.environ.get("HOLOCRONIX_URL", HOLOCRONIX_URL_DEFAULT))
+            console.print("Re-pinning channels from `guix describe`...")
+            _write_guix_channels(d, name, url)
+        console.print(f"Building cave [cyan]{name}[/] with Guix...")
+        # --root=result: a GC-rooted symlink, same shape as nix's result link.
+        # Guix's register-root symlink()s without handling EEXIST, so a stale
+        # link from an earlier build would abort this one; nix replaces its
+        # own link.  Only ever remove a symlink, never a real file.
+        result_link = d / "result"
+        if result_link.is_symlink():
+            result_link.unlink()
+        # --max-silent-time=0: no silence timeout.  Compressing a multi-GB
+        # image produces no output for a long stretch, which the daemon's
+        # default 3600s limit would kill.  0 means "no limit" to the daemon.
+        run(_guix_cmd(d, "build", *_guix_load_path_args(),
+                      "-f", "cave.scm", "--root=result",
+                      "--max-silent-time=0"), cwd=d)
+    else:
+        if update:
+            console.print("Updating all inputs...")
+            run(["nix", "flake", "update"], cwd=d)
+        console.print(f"Building cave [cyan]{name}[/]...")
+        run(["nix", "build", ".#container", "--print-build-logs"], cwd=d)
 
     result_link = d / "result"
     if not result_link.exists():
@@ -2177,17 +2389,19 @@ def guide():
         "[bold]Setting up a new jedicave (reproducible offline-capable sandboxed container)[/]\n"
         "\n"
         "[bold cyan]1. Create the cave[/]\n"
-        "   jedi init my-cave\n"
+        "   jedi init my-cave                  # Nix backend (default)\n"
+        "   jedi init --backend guix my-cave   # Guix backend\n"
         "   Creates scaffolding at ~/.config/jedicaves/my-cave/\n"
         "\n"
-        "[bold cyan]2. Configure the flake[/]\n"
-        "   Edit the generated flake.nix to add your project inputs\n"
-        "   and devShells. The file has commented examples.\n"
+        "[bold cyan]2. Configure the cave[/]\n"
+        "   Nix:  edit flake.nix to add your project inputs and devShells.\n"
+        "   Guix: edit cave.scm to add your project's packages.\n"
+        "   Both files have commented examples.\n"
         "   jedi show my-cave         # see cave path and details\n"
         "\n"
         "[bold cyan]3. Build the container image[/]\n"
         "   jedi build my-cave\n"
-        "   Builds with Nix and loads the image into Docker.\n"
+        "   Builds with Nix or Guix and loads the image into Docker.\n"
         "\n"
         "[bold cyan]4. Seed your source code[/]\n"
         "   jedi seed ~/code/my-project my-cave\n"
@@ -2208,7 +2422,7 @@ def guide():
         "[bold cyan]Other useful commands[/]\n"
         "   jedi list                  # list all caves\n"
         "   jedi firewall status       # check firewall state\n"
-        "   jedi inputs my-cave        # show locked flake inputs\n"
+        "   jedi inputs my-cave        # show locked flake inputs / Guix channels\n"
         "   jedi logs -f my-cave       # follow container logs\n"
         "   jedi destroy my-cave       # tear down a cave\n"
     )

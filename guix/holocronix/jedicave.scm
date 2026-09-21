@@ -112,10 +112,14 @@ if [ -d /repos ]; then
       echo \"[jedicave] Cloning $repo_name...\"
       git clone \"$bare\" \"/workspace/$repo_name\"
       # Materialize every seeded branch as a local tracking branch.
+      # Use the full refname, not %(refname:short): the short form of
+      # refs/remotes/origin/HEAD is the bare word \"origin\", which neither
+      # the origin/ strip nor the HEAD test below would catch, leaving a
+      # junk local branch called \"origin\".
       git -C \"/workspace/$repo_name\" for-each-ref \\
-        --format='%(refname:short)' refs/remotes/origin/ |
+        --format='%(refname)' refs/remotes/origin/ |
         while read -r remote_ref; do
-          branch=\"${remote_ref#origin/}\"
+          branch=\"${remote_ref#refs/remotes/origin/}\"
           [ \"$branch\" = \"HEAD\" ] && continue
           git -C \"/workspace/$repo_name\" show-ref --verify --quiet \\
             \"refs/heads/$branch\" ||
@@ -170,7 +174,14 @@ exec sleep infinity
                          (claude-settings #f)
                          (project-setup "")
                          (extra-directives '())
-                         (max-layers 100))
+                         (max-layers 100)
+                         ;; The image is a local artifact, loaded into Docker
+                         ;; right after it is built, so compression speed
+                         ;; matters more than size: `gzip -9n', what `guix
+                         ;; pack' uses, spends tens of minutes on a multi-GB
+                         ;; archive to save a few percent.  Must still produce
+                         ;; a .gz: build-docker-image looks for image.tar.gz.
+                         (compressor '("gzip" "-1n")))
   "Return a file-like object: a gzip-compressed Docker image archive named
 NAME, loadable with `docker load'.
 
@@ -179,7 +190,8 @@ on PATH.  INFRA-PACKAGES go to /usr/local/sbin, root-only.  ENV is an alist
 of extra environment variables; it overrides the defaults.  SYMLINKS is an
 alist of (IMAGE-PATH . PROFILE-RELATIVE-TARGET), for instance
 (\"/.cargo\" . \"share/cargo-config\").  EXTRA-DIRECTIVES are appended to the
-populate directives (see 'evaluate-populate-directive')."
+populate directives (see 'evaluate-populate-directive').  COMPRESSOR is the
+command compressing the archive; it must produce gzip output."
   ;; Inside a `profile' form, `name' refers to the record's own field, so
   ;; the strings are computed outside.
   (define agent-profile
@@ -335,9 +347,39 @@ populate directives (see 'evaluate-populate-directive')."
                                         (not (member f '("." ".."))))))
                     '())))
 
+            (define (infra-file name)
+              ;; Path of NAME in the infra profile's bin or sbin, or #f.
+              (find file-exists?
+                    (list (string-append infra "/sbin/" name)
+                          (string-append infra "/bin/" name))))
+
+            (define nft-symlinks
+              ;; Guix's `iptables' defaults to the legacy backend, which on an
+              ;; nftables kernel fails with "Table does not exist".  Docker
+              ;; and modern distro kernels use nft, and the Nix image's
+              ;; iptables already defaults to it, so point the names `jedi
+              ;; firewall' calls at the -nft variants.  A later directive
+              ;; overrides an earlier one, so these win over 'bin-symlinks'.
+              (filter-map
+               (lambda (tool)
+                 (let* ((base (car tool))
+                        (suffix (cdr tool))
+                        (nft (infra-file (string-append base "-nft" suffix))))
+                   (and nft
+                        `(,(string-append "/usr/local/sbin/" base suffix)
+                          -> ,nft))))
+               '(("iptables" . "") ("iptables" . "-save")
+                 ("iptables" . "-restore")
+                 ("ip6tables" . "") ("ip6tables" . "-save")
+                 ("ip6tables" . "-restore"))))
+
             (define directives
               `((directory "/tmp" 0 0 #o1777)
                 (directory #$(%store-prefix) 0 0 #o755)
+                ;; iptables, run as root by `jedi firewall', creates
+                ;; /run/xtables.lock and fails if /run does not exist.
+                (directory "/run" 0 0 #o755)
+                (directory "/var/run" 0 0 #o755)
                 (directory "/etc")
                 (file "/etc/passwd"
                       ,(string-append
@@ -379,6 +421,7 @@ populate directives (see 'evaluate-populate-directive')."
                 (directory "/usr/local/sbin" 0 0 #o750)
                 ,@(bin-symlinks "bin")
                 ,@(bin-symlinks "sbin")
+                ,@nft-symlinks
                 ,@'#$extra-directives))
 
             (setenv "PATH" (string-append #+(file-append tar "/bin") ":"
@@ -399,7 +442,7 @@ populate directives (see 'evaluate-populate-directive')."
                                            ("/workspace" ,uid ,gid)
                                            ("/commandhistory" ,uid ,gid)
                                            ("/env" ,uid ,gid))
-                                #:compressor '("gzip" "-9n")
+                                #:compressor '#$compressor
                                 #:creation-time (make-time time-utc 0 1)
                                 #:max-layers #$max-layers)))))
 
