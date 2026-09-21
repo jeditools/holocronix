@@ -4,8 +4,9 @@ Guile modules for building jedicave-style images with GNU Guix instead of
 Nix. This directory is a Guix load path: use it with `guix -L guix ...` from
 the repository root.
 
-Status: exploration, one sub-problem at a time. Nothing here is wired into
-the `jedi` CLI yet.
+Status: experimental but usable. `jedi init --backend guix` scaffolds a Guix
+cave and `jedi build` builds it; see "Sub-problem 4" below. The one thing
+missing for parity is the agents, which have no Guix packages yet.
 
 ## Sub-problem 1: baked Rust dependencies
 
@@ -256,6 +257,63 @@ Expected: `uid=1000(yoda)`, `/workspace`, home and workspace owned by yoda,
 Compressed tarball is about 900 MB; the loaded image about 6 GB, since the
 base set includes gcc-toolchain, python, node, and rust.
 
+## Sub-problem 4: the `jedi` CLI
+
+Goal: a Guix cave managed by the same commands as a Nix cave.
+
+A cave is Nix-backed when it holds a `flake.nix`, Guix-backed when it holds
+a `cave.scm`. Only three commands care:
+
+| Command | Nix | Guix |
+|---|---|---|
+| `jedi init` | writes `flake.nix` | `--backend guix` writes `cave.scm` and `channels.scm` |
+| `jedi build` | `nix build .#container` | `guix time-machine -C channels.scm -- build -f cave.scm --root=result` |
+| `jedi update` | `nix flake update` | re-pins `channels.scm` from `guix describe` |
+| `jedi inputs` | flake input table | channel table |
+
+Both end with `docker load` of a `jedicave:latest` image, so `seed`, `up`,
+`enter`, `shell`, `exec`, `firewall`, `diff`, `harvest`, `fetch`, and
+`destroy` are untouched and behave identically.
+
+```sh
+jedi init --backend guix my-cave
+$EDITOR ~/.config/jedicaves/my-cave/cave.scm   # add packages, cargo-vendor
+jedi build my-cave
+jedi seed ~/code/my-project my-cave
+jedi up my-cave && jedi enter my-cave
+```
+
+### Pinning
+
+`channels.scm` is the Guix counterpart of `flake.lock`: `jedi init` writes
+the holocronix channel plus everything `guix describe -f channels` reports,
+each at a commit, and `jedi build` runs under `guix time-machine` with it.
+`jedi update` re-pins. Delete the file to build with whatever `guix` is on
+`PATH`.
+
+When `HOLOCRONIX_URL` points at a local checkout, as the devShell sets it,
+`init` records that path and pins it to the checkout's `HEAD`, and `build`
+also passes `-L <checkout>/guix` so the working tree wins over the pinned
+commit. That is what makes editing the modules and rebuilding immediate.
+For a cave you intend to keep, point the channel at a real remote so the
+pin means something to someone else.
+
+Adding another channel, a project's own or baobit's, means editing the
+first list in `channels.scm` by hand; `jedi` only rewrites the file on
+`update`.
+
+### Notes
+
+- The image tag must stay `jedicave:latest`, which is what `compose.yml`
+  expects; the scaffolded `cave.scm` passes `#:name "jedicave"`.
+- Image compression defaults to `gzip -1n`, not `guix pack`'s `-9n`. The
+  archive is loaded into Docker immediately, so an hour of compression to
+  save a few percent is wasted; `jedi build` also passes
+  `--max-silent-time=0`, since compressing a multi-GB archive is silent for
+  long enough to trip the daemon's default one-hour limit.
+- A Guix cave has no agents in it yet. Until they are packaged, use it as a
+  reproducible build sandbox and run agents in a Nix cave.
+
 ### Known limits
 
 - **Same crate from two git sources.** xous-core's lockfile lists `com_rs`
@@ -271,5 +329,6 @@ base set includes gcc-toolchain, python, node, and rust.
 - **No oh-my-zsh.** Guix has no package for it; `.zshrc` skips it when
   absent. The Claude plugin seed directory and settings are not baked yet
   either, pending agent packaging.
-- **Not wired into `jedi`.** `jedi build` still runs `nix build`; a cave with
-  a `cave.scm` needs the `guix build -f` and `docker load` steps by hand.
+- **No agents.** The Guix image ships the base tools and the project
+  toolchain, but claude-code and the others are not packaged for Guix yet,
+  so a Guix cave cannot run an agent.

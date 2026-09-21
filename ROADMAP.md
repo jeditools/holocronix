@@ -19,8 +19,8 @@ usage.
 | Baked Rust dependencies (git sources) | Done, on a local fixture workspace. Not yet tried on xous-core, dc34-api, or libtropic-rs. |
 | Xous cross toolchain in the image | Done. baobit's `rust-xous-toolchain` via load path under baobit's pinned Guix; std hello world cross-compiles offline. Channel form blocked by baobit's broken channel auth. |
 | Image config: user, workdir, env, file ownership | Done. `jedicave-image` in `guix/holocronix/jedicave.scm` on a forked docker builder with `#:user`, `#:working-dir`, `#:owners`. Verified on `examples/hello-rust/cave.scm`. |
-| Agent tooling packaged for Guix | Planned. |
-| CLI backend selection | Planned. |
+| CLI backend selection | Done. `jedi init --backend guix` scaffolds `cave.scm` + `channels.scm`; `build`, `update`, `inputs` dispatch on which file the cave has. |
+| Agent tooling packaged for Guix | Planned. The Guix image has no agents yet. |
 
 ### Architecture
 
@@ -30,6 +30,7 @@ holocronix/
 ├── config/                   ← shared (zshrc, tmux, firewall, etc.)
 ├── lib/mkJediCave.nix        ← Nix backend
 ├── flake.nix                 ← Nix entry point
+├── .guix-channel             ← makes this repo a Guix channel (directory "guix")
 ├── guix/                     ← Guix backend, a Guile load path (guix -L guix)
 │   ├── README.md
 │   └── holocronix/
@@ -47,9 +48,10 @@ holocronix/
 | Input pinning | `flake.lock` | `channels.scm` from `guix describe -f channels`, run under `guix time-machine` |
 | Project toolchain | `devShells` output | `guix shell` manifest |
 | Rust dependencies | `importCargoLock` / vendored deps in devShell | `cargo-vendor` from `(holocronix cargo-vendor)`, same idea as `importCargoLock` |
-| Cave builder | `mkJediCave { projectShells = [...]; }` | Guile function composing packages into a container spec |
-| Extra packages | `extraPackages` | Additional packages in manifest |
-| Build command | `nix build` | `guix pack` |
+| Cave builder | `mkJediCave { projectShells = [...]; }` | `jedicave-image` from `(holocronix jedicave)` |
+| Cave definition file | `flake.nix` | `cave.scm` |
+| Extra packages | `extraPackages` | `#:extra-packages` |
+| Build command | `nix build .#container` | `guix time-machine -C channels.scm -- build -f cave.scm` |
 
 ### Implementation steps
 
@@ -70,11 +72,14 @@ holocronix/
    Fetch release tarballs and wrap them with node, as llm-agents.nix
    does, in a channel inside this repo.
 
-4. **CLI backend selection** — add `jedi init --backend guix <name>`
-   (default remains `nix`). Scaffold the appropriate cave files:
-   `flake.nix` for Nix, `cave.scm` / `channels.scm` for Guix. Build
-   command dispatches to `nix build` or `guix pack` based on which
-   files are present in the cave.
+4. **CLI backend selection** — done. `jedi init --backend guix <name>`
+   scaffolds `cave.scm` and `channels.scm` (default remains `nix`,
+   scaffolding `flake.nix`). `cave_backend()` dispatches on which file
+   the cave directory holds: `build` runs `guix time-machine -C
+   channels.scm -- build -f cave.scm --root=result` then `docker load`,
+   `update` re-pins channels from `guix describe`, and `inputs` prints
+   the channel table. Everything downstream of `build` was already
+   backend-agnostic and is untouched.
 
 5. **Testing** — verify feature parity: firewall, bare repo handoff,
    volumes, `jedi shell`/`up`/`enter` all work identically with both
