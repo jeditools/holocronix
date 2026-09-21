@@ -408,6 +408,13 @@ GIT-HASHES is an alist of commit to nix-base32 sha256 of the checkout; those
 commits become fixed-output `git-fetch' origins instead.  GIT-CHECKOUTS is an
 alist of commit or URL to a file-like object to use as the checkout, for
 local fixtures or pre-fetched sources."
+  ;; Check before reading: opening a missing lockfile raises a bare ENOENT
+  ;; that `guix build -f' reports as "failed to load 'cave.scm': No such file
+  ;; or directory", which blames the wrong file entirely.
+  (unless (file-exists? lockfile)
+    (error (string-append "cargo-vendor: " project
+                          ": no such Cargo.lock:")
+           lockfile))
   (let* ((lock-version (cargo-lock-version lockfile))
          (deps (filter lock-package-source (read-cargo-lock lockfile)))
          (registry (filter crates-io-package? deps))
