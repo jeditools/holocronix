@@ -271,7 +271,7 @@ a `cave.scm`. Only three commands care:
 | `jedi update` | `nix flake update` | re-pins `channels.scm` from `guix describe` |
 | `jedi inputs` | flake input table | channel table |
 
-Both end with `docker load` of a `jedicave:latest` image, so `seed`, `up`,
+Both end with `docker load` of the cave's own image, so `seed`, `up`,
 `enter`, `shell`, `exec`, `firewall`, `diff`, `harvest`, `fetch`, and
 `destroy` are untouched and behave identically.
 
@@ -304,8 +304,10 @@ first list in `channels.scm` by hand; `jedi` only rewrites the file on
 
 ### Notes
 
-- The image tag must stay `jedicave:latest`, which is what `compose.yml`
-  expects; the scaffolded `cave.scm` passes `#:name "jedicave"`.
+- Each cave has its own image, `jedicave-<cave>:latest`. The scaffolded
+  `cave.scm` passes that as `#:name`, matching what `compose.yml` expects.
+  Keep the two in step, or let `jedi build` do it: it retags whatever the
+  definition produced under the cave's own name.
 - Image compression defaults to `gzip -1n`, not `guix pack`'s `-9n`. The
   archive is loaded into Docker immediately, so an hour of compression to
   save a few percent is wasted; `jedi build` also passes

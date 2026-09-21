@@ -420,9 +420,16 @@ and Gondolin, see [RELATED-WORK.md](RELATED-WORK.md).
 | User | Unprivileged (UID 1000, no sudo), working dir `/workspace` |
 | Tools | `rg`, `fd`, `fzf`, `delta`, `ast-grep`, `tmux`, `jq`, `vim`, `iptables`, `ipset` |
 | Volumes | Command history (`/commandhistory`), Claude config (`/env/.claude`) |
+| Image | One per cave, `jedicave-<cave>:latest`, so building one cave never replaces another's image |
 | Skills | [anthropics/skills](https://github.com/anthropics/skills), [trailofbits/skills](https://github.com/trailofbits/skills), [trailofbits/skills-curated](https://github.com/trailofbits/skills-curated) |
 
 All packages and config are baked into the image at build time — no runtime downloads.
+
+Caves created before per-cave image names all shared one `jedicave:latest`
+tag. They keep working: `jedi up` adopts that image once, with a warning, and
+the next `jedi build` gives the cave an image of its own. `jedi destroy`
+leaves the image in place, since destroying a cave is reversible; remove it
+with `docker rmi jedicave-<cave>:latest` when you want the space back.
 
 ## Troubleshooting
 

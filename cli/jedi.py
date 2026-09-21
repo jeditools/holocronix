@@ -32,6 +32,12 @@ DATA_DIR = Path(os.environ.get("JEDI_DATA_DIR", Path(__file__).resolve().parent.
 COMPOSE_SERVICE = "shell"
 HOLOCRONIX_URL_DEFAULT = "github:jeditools/holocronix"
 
+# Image naming.  Every cave gets its own Docker repository, so building one
+# cave never replaces the image another cave runs.  Caves created before this
+# scheme shared LEGACY_IMAGE; `jedi up` adopts that image once, see
+# _ensure_image().
+LEGACY_IMAGE = "jedicave:latest"
+
 
 # --- Helpers ---
 
@@ -165,6 +171,45 @@ def _print_guix_channels(name: str, d: Path) -> None:
         field = lambda key: (re.search(rf'\({key} "([^"]+)"\)', block) or [None, ""])[1]
         table.add_row(m.group(1), field("url"), field("branch"), field("commit")[:12])
     console.print(table)
+
+
+def image_slug(cave_name: str) -> str:
+    """Cave name as a Docker repository component: lowercase, and only the
+    characters a repository path allows."""
+    slug = re.sub(r"[^a-z0-9._-]", "-", cave_name.lower()).strip("-._")
+    return slug or "cave"
+
+
+def image_ref(cave_name: str) -> str:
+    """Docker image reference for a cave, e.g. jedicave-dagobah:latest."""
+    return f"jedicave-{image_slug(cave_name)}:latest"
+
+
+def _image_exists(ref: str) -> bool:
+    return subprocess.run(["docker", "image", "inspect", ref],
+                          capture_output=True).returncode == 0
+
+
+def _ensure_image(name: str) -> None:
+    """Fail early, with a useful message, when a cave's image is missing.
+
+    Caves built before per-cave image names all produced LEGACY_IMAGE.  Adopt
+    it once, so an existing cave keeps starting the image it was already
+    running; the next `jedi build` replaces it with a cave-specific one.
+    """
+    ref = image_ref(name)
+    if _image_exists(ref):
+        return
+    if _image_exists(LEGACY_IMAGE):
+        console.print(
+            f"[yellow]Cave '{name}' has no image of its own yet; "
+            f"adopting {LEGACY_IMAGE}.[/]\n"
+            f"[dim]  Caves used to share one image tag. Run 'jedi build "
+            f"{name}' to give this cave its own.[/]")
+        run(["docker", "tag", LEGACY_IMAGE, ref])
+        return
+    err_console.print(f"[red]No image for cave '{name}'.[/] Run: jedi build {name}")
+    raise typer.Exit(1)
 
 
 def complete_cave_name(incomplete: str) -> list[str]:
@@ -522,6 +567,10 @@ FLAKE_TEMPLATE = """\
     mkJediCave = holocronix.lib.${{system}}.mkJediCave;
   in {{
     packages.${{system}}.container = mkJediCave {{
+      # Image name for this cave. Keep it unique per cave: caves that share
+      # a name share a Docker tag, so building one replaces the other's image.
+      name = "jedicave-{slug}";
+
       # List your project devShells here:
       # projectShells = [
       #   inputs.my-project.devShells.${{system}}.default
@@ -547,8 +596,10 @@ CAVE_SCM_TEMPLATE = """\
              (gnu packages))
 
 (jedicave-image
- ;; Keep "jedicave": compose.yml expects the image tag jedicave:latest.
- #:name "jedicave"
+ ;; Image name for this cave, matching what compose.yml expects.  Keep it
+ ;; unique per cave: caves that share a name share a Docker tag, so building
+ ;; one would replace the other's image.
+ #:name "jedicave-{slug}"
 
  ;; Project toolchain, added to the jedicave base tools
  ;; (%jedicave-base-specs).  Package specs as `guix install` takes them.
@@ -699,7 +750,7 @@ def _generate_compose(name: str, policy: dict) -> str:
 
     parts.append(f"""\
   shell:
-    image: jedicave:latest
+    image: {image_ref(name)}
     init: true
     stdin_open: true
     tty: true
@@ -1077,12 +1128,14 @@ def init(
     url = holocronix_url or os.environ.get("HOLOCRONIX_URL", HOLOCRONIX_URL_DEFAULT)
 
     if backend == "guix":
-        (d / "cave.scm").write_text(CAVE_SCM_TEMPLATE.format(name=name))
+        (d / "cave.scm").write_text(
+            CAVE_SCM_TEMPLATE.format(name=name, slug=image_slug(name)))
         _write_guix_channels(d, name, _holocronix_channel_url(url))
         cave_file = "cave.scm"
         edit_hint = "add your project's packages"
     else:
-        (d / "flake.nix").write_text(FLAKE_TEMPLATE.format(name=name, holocronix_url=url))
+        (d / "flake.nix").write_text(FLAKE_TEMPLATE.format(
+            name=name, slug=image_slug(name), holocronix_url=url))
         cave_file = "flake.nix"
         edit_hint = "add your project inputs and devShells"
     (d / "policy.yaml").write_text(POLICY_DEFAULTS)
@@ -1228,8 +1281,26 @@ def build(
         raise typer.Exit(1)
 
     console.print("Loading image into Docker...")
-    run(["docker", "load", "-i", str(result_link)])
-    console.print(f"[green]Cave '{name}' built and loaded[/]")
+    loaded = subprocess.run(["docker", "load", "-i", str(result_link)],
+                            capture_output=True, text=True)
+    console.print(f"[dim]  docker load -i {result_link}[/]")
+    if loaded.returncode != 0:
+        err_console.print(f"[red]docker load failed:[/]\n{loaded.stderr.strip()}")
+        raise typer.Exit(1)
+    console.print(loaded.stdout.strip())
+
+    # Both builders name the image from their own definition, which knows
+    # nothing about the cave directory, and older cave definitions all say
+    # "jedicave".  Retag under this cave's own name so building one cave can
+    # never replace another's image.
+    m = re.search(r"Loaded image(?: ID)?: (\S+)", loaded.stdout)
+    if not m:
+        err_console.print("[red]Could not tell which image docker loaded[/]")
+        raise typer.Exit(1)
+    ref = image_ref(name)
+    if m.group(1) != ref:
+        run(["docker", "tag", m.group(1), ref])
+    console.print(f"[green]Cave '{name}' built and loaded as {ref}[/]")
 
 
 @app.command()
@@ -1241,6 +1312,7 @@ def up(
 ):
     """Start cave container (one session)."""
     name, d = resolve_cave(name)
+    _ensure_image(name)
     policy = _load_policy(d)
     _write_compose(d, name, policy)
     env_file = _resolve_secrets(d, policy)
@@ -1385,6 +1457,8 @@ def shell(
 ):
     """Ephemeral shell (no 'up' needed)."""
     name, d = resolve_cave(name)
+    _ensure_image(name)
+    _write_compose(d, name, _load_policy(d))
     project = compose_project(d, name, session)
     os.environ["JEDI_SESSION"] = session
     if firewall:
@@ -2482,6 +2556,12 @@ def destroy(
         console.print(f"[green]Cave '{name}' destroyed[/]")
         console.print(f"  Moved to: {trash_dest}")
         console.print(f"  To restore: mv {trash_dest} {d}")
+        ref = image_ref(name)
+        if _image_exists(ref):
+            # Kept on purpose: destroy is reversible, and rebuilding the image
+            # is the slow part of restoring a cave.
+            console.print(f"  Image {ref} kept. To reclaim the space: "
+                          f"docker rmi {ref}")
     else:
         console.print("Aborted")
 
