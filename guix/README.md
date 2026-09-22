@@ -347,10 +347,12 @@ guix time-machine -C channels.scm -- build -L <holocronix>/guix -f cave.scm --dr
 Nothing named `rust-sysroot` or `rust-xous` in the output means it resolves
 from the store.
 
-**`jedi update` will undo this.** It rewrites `channels.scm` from `guix
-describe`, which drops the extra channel and moves the Guix pin, so the next
-build rebuilds the world. Leave a note at the top of the file, and re-apply
-both edits if you ever run it on such a cave.
+**`jedi update` leaves both alone.** It re-pins the `holocronix` form in
+place and nothing else, so extra channels, a hand-set Guix commit, your
+comments and your layout all survive; it prints which channels it left
+untouched. Add `--guix` when you do want the Guix pin moved to whatever
+`guix describe` reports, which on a cave like this means rebuilding the
+other channel's packages.
 
 A channel with no `(introduction ...)` draws a warning that it cannot be
 authenticated. That is expected for a local checkout, and for baobit, whose

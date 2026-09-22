@@ -136,22 +136,134 @@ def _channels_holocronix_url(d: Path) -> str | None:
     return m.group(1) if m else None
 
 
-def _write_guix_channels(d: Path, name: str, holocronix_url: str) -> None:
-    """Write channels.scm: holocronix, pinned to the checkout's HEAD when it is
-    a local git repository, plus the channels of the current `guix describe`."""
+def _mask_scheme(text: str) -> str:
+    """TEXT with comment and string contents blanked out, same length, so
+    offsets still line up.  Scanning the mask keeps `(channel` inside a
+    comment or a string from being mistaken for a real form."""
+    out = list(text)
+    i, in_string = 0, False
+    while i < len(text):
+        c = text[i]
+        if in_string:
+            if c == "\\":
+                out[i] = " "
+                if i + 1 < len(text):
+                    out[i + 1] = " "
+                i += 2
+                continue
+            if c == '"':
+                in_string = False
+            else:
+                out[i] = " "
+        elif c == '"':
+            in_string = True
+        elif c == ";":
+            end = text.find("\n", i)
+            end = len(text) if end < 0 else end
+            out[i:end] = " " * (end - i)
+            i = end
+            continue
+        i += 1
+    return "".join(out)
+
+
+def _channel_blocks(text: str) -> list[tuple[str, int, int]]:
+    """Locate each `(channel ...)` form in Scheme TEXT.  Returns
+    (channel-name, start, end) offsets, outermost forms only."""
+    masked = _mask_scheme(text)
+    blocks: list[tuple[str, int, int]] = []
+    # The lookahead matters: without it `(channels/guix.scm)` in a comment
+    # would match, and so would any other symbol starting with "channel".
+    for m in re.finditer(r"\(channel(?=[\s()])", masked):
+        start = m.start()
+        if blocks and start < blocks[-1][2]:
+            continue                            # nested in a form already taken
+        depth, j = 0, start
+        while j < len(masked):
+            if masked[j] == "(":
+                depth += 1
+            elif masked[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    j += 1
+                    break
+            j += 1
+        name = re.search(r"\(name\s+'([\w-]+)\)", masked[start:j])
+        blocks.append((name.group(1) if name else "", start, j))
+    return blocks
+
+
+def _guix_describe_channels() -> dict[str, str]:
+    """Channel name to source text, from the running Guix."""
     result = subprocess.run(["guix", "describe", "-f", "channels"],
                             capture_output=True, text=True)
     if result.returncode != 0:
         err_console.print(f"[red]guix describe failed:[/]\n{result.stderr.strip()}")
         raise typer.Exit(1)
-    pin = ""
-    if Path(holocronix_url).is_dir():
-        head = subprocess.run(["git", "-C", holocronix_url, "rev-parse", "HEAD"],
-                              capture_output=True, text=True)
-        if head.returncode == 0:
-            pin = f'\n        (commit "{head.stdout.strip()}")'
-    (d / "channels.scm").write_text(CHANNELS_TEMPLATE.format(
-        name=name, url=holocronix_url, pin=pin, describe=result.stdout.strip()))
+    text = result.stdout
+    return {name: text[start:end]
+            for name, start, end in _channel_blocks(text)}
+
+
+def _write_guix_channels(d: Path, name: str, holocronix_url: str,
+                         refresh_guix: bool = False) -> list[str]:
+    """Write channels.scm and return the names of the channels kept as they
+    were.
+
+    jedi owns exactly one entry, `holocronix`, pinned to the checkout's HEAD
+    when it is a local git repository.  Every other channel belongs to
+    whoever put it there: a project's own channel, a deliberately older `guix`
+    pin that another channel's packages were built against.  Re-pinning those
+    can silently turn a four-minute build into an overnight one, so on an
+    existing file only the holocronix form is rewritten, in place; comments,
+    layout and every other form survive untouched.  With REFRESH_GUIX the
+    `guix` form is refreshed from `guix describe` as well.
+    """
+    def holocronix_form(indent: int) -> str:
+        pad = " " * indent
+        pin = ""
+        if Path(holocronix_url).is_dir():
+            head = subprocess.run(
+                ["git", "-C", holocronix_url, "rev-parse", "HEAD"],
+                capture_output=True, text=True)
+            if head.returncode == 0:
+                pin = f'\n{pad}(commit "{head.stdout.strip()}")'
+        return (f"(channel\n{pad}(name 'holocronix)\n"
+                f'{pad}(url "{holocronix_url}")\n'
+                f'{pad}(branch "main"){pin})')
+
+    path = d / "channels.scm"
+    if not path.exists():
+        rest = [text for chan, text in _guix_describe_channels().items()
+                if chan != "holocronix"]
+        channels = "\n      ".join([holocronix_form(7)] + rest)
+        path.write_text(CHANNELS_TEMPLATE.format(name=name, channels=channels))
+        return []
+
+    text = path.read_text()
+    blocks = _channel_blocks(text)
+    if not any(chan == "holocronix" for chan, _, _ in blocks):
+        err_console.print(
+            f"[red]{path} has no holocronix channel;[/] leaving it alone")
+        raise typer.Exit(1)
+
+    fresh = _guix_describe_channels() if refresh_guix else {}
+    kept: list[str] = []
+    edits: list[tuple[int, int, str]] = []
+    for chan, start, end in blocks:
+        if chan == "holocronix":
+            # Indent the fields to match where the form already sits, the
+            # way `guix describe -f channels` lays them out: one column in.
+            column = start - (text.rfind("\n", 0, start) + 1)
+            edits.append((start, end, holocronix_form(column + 1)))
+        elif chan == "guix" and "guix" in fresh:
+            edits.append((start, end, fresh["guix"].strip()))
+        else:
+            kept.append(chan)
+    for start, end, replacement in reversed(edits):
+        text = text[:start] + replacement + text[end:]
+    path.write_text(text)
+    return kept
 
 
 def _print_guix_channels(name: str, d: Path) -> None:
@@ -628,19 +740,17 @@ CHANNELS_TEMPLATE = """\
 ;;
 ;; `jedi build` runs `guix time-machine -C channels.scm -- build ...`, so the
 ;; image is built with exactly these commits: the Guix counterpart of
-;; flake.lock.  `jedi update` re-pins to the current `guix describe` and to
-;; the holocronix checkout's HEAD.  Delete this file to build with whatever
-;; `guix` is on PATH instead.
+;; flake.lock.  Delete this file to build with whatever `guix` is on PATH
+;; instead.
 ;;
-;; Add other channels (a project's own, baobit, ...) to the first list.
+;; Add other channels here as needed -- a project's own, baobit, ... -- and
+;; edit any commit by hand.  `jedi update` re-pins only the holocronix entry
+;; and leaves everything else exactly as written, because another channel's
+;; packages are only in your store under the `guix` commit they were built
+;; against: moving that pin can turn a short build into an overnight one.
+;; `jedi update --guix` re-pins the guix entry too, when you do want it.
 
-(append
- (list (channel
-        (name 'holocronix)
-        (url "{url}")
-        (branch "main"){pin}))
- ;; Pinned from `guix describe -f channels`:
- {describe})
+(list {channels})
 """
 
 POLICY_DEFAULTS = """\
@@ -1209,20 +1319,25 @@ def inputs(
 def update(
     name: Annotated[Optional[str], typer.Argument(help="Cave name", autocompletion=complete_cave_name)] = None,
     input: Annotated[Optional[str], typer.Option("--input", "-i", help="Specific input to update (default: all)")] = None,
+    guix: Annotated[bool, typer.Option("--guix", help="Guix caves: also re-pin the guix channel from `guix describe`")] = False,
 ):
-    """Update flake inputs or re-pin Guix channels (lock only, no build)."""
+    """Update flake inputs, or re-pin a Guix cave's holocronix channel."""
     name, d = resolve_cave(name)
     if cave_backend(d) == "guix":
         if input:
-            err_console.print("[red]--input is not supported for Guix caves;[/] "
-                              "jedi update re-pins every channel")
+            err_console.print("[red]--input is not supported for Guix caves.[/] "
+                              "jedi update re-pins holocronix; add --guix to "
+                              "re-pin the guix channel as well")
             raise typer.Exit(1)
         check_deps("guix")
         url = _channels_holocronix_url(d) or _holocronix_channel_url(
             os.environ.get("HOLOCRONIX_URL", HOLOCRONIX_URL_DEFAULT))
-        console.print("Re-pinning channels from `guix describe`...")
-        _write_guix_channels(d, name, url)
+        console.print("Re-pinning holocronix"
+                      + (" and guix" if guix else "") + "...")
+        kept = _write_guix_channels(d, name, url, refresh_guix=guix)
         console.print(f"[green]channels.scm updated for cave '{name}'[/]")
+        if kept:
+            console.print(f"[dim]  left untouched: {', '.join(kept)}[/]")
         return
     check_deps()
 
@@ -1252,7 +1367,7 @@ def build(
         if update:
             url = _channels_holocronix_url(d) or _holocronix_channel_url(
                 os.environ.get("HOLOCRONIX_URL", HOLOCRONIX_URL_DEFAULT))
-            console.print("Re-pinning channels from `guix describe`...")
+            console.print("Re-pinning holocronix...")
             _write_guix_channels(d, name, url)
         console.print(f"Building cave [cyan]{name}[/] with Guix...")
         # --root=result: a GC-rooted symlink, same shape as nix's result link.
