@@ -302,6 +302,60 @@ Adding another channel, a project's own or baobit's, means editing the
 first list in `channels.scm` by hand; `jedi` only rewrites the file on
 `update`.
 
+### A cave that needs another channel
+
+A cave whose toolchain lives outside holocronix and Guix proper, for
+instance baobit's `rust-xous-toolchain`, adds that channel to
+`channels.scm` and uses its modules from `cave.scm`:
+
+```scheme
+;; channels.scm
+(list (channel (name 'holocronix) (url "...") (branch "main") (commit "..."))
+      (channel (name 'baobit) (url "/home/you/code/baochip/baobit")
+               (branch "crossbar-boot-305693ed")
+               (commit "e492b6444cf7ea17e4f0c4c78be40792b81e9333"))
+      (channel (name 'guix) (url "https://git.guix.gnu.org/guix.git")
+               (branch "master")
+               ;; baobit's pin, NOT `guix describe`'s: see below.
+               (commit "36d403cfd77ff5452978cf94425902675e6ad81b")
+               (introduction ...)))
+```
+
+```scheme
+;; cave.scm
+(use-modules (holocronix jedicave) (rust-xous-toolchain) (gnu packages))
+(jedicave-image
+ #:name "jedicave-xous-toolchain"
+ ;; rust-xous-toolchain, not plain "rust": it ships its own rustc and cargo
+ ;; wrappers, so adding both would collide in the profile.
+ #:extra-packages (list rust-xous-toolchain))
+```
+
+Two things decide whether this is a four-minute build or an overnight one.
+
+**Match the other channel's Guix pin.** A package is only in your store
+under the exact Guix commit it was built with. baobit pins `36d403cf`, so a
+cave pinning anything else re-derives `rust-xous-toolchain` and rebuilds the
+Xous sysroot from the betrusted-io Rust fork. Take the pin from the other
+project's own channels file rather than from `guix describe`. Check before
+committing to a build:
+
+```sh
+guix time-machine -C channels.scm -- build -L <holocronix>/guix -f cave.scm --dry-run
+```
+
+Nothing named `rust-sysroot` or `rust-xous` in the output means it resolves
+from the store.
+
+**`jedi update` will undo this.** It rewrites `channels.scm` from `guix
+describe`, which drops the extra channel and moves the Guix pin, so the next
+build rebuilds the world. Leave a note at the top of the file, and re-apply
+both edits if you ever run it on such a cave.
+
+A channel with no `(introduction ...)` draws a warning that it cannot be
+authenticated. That is expected for a local checkout, and for baobit, whose
+own signing chain is broken on main.
+
 ### Notes
 
 - Each cave has its own image, `jedicave-<cave>:latest`. The scaffolded
