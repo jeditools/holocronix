@@ -187,3 +187,74 @@ the SDK via `imagePath`.
   `docs/snapshots.md`, `docs/limitations.md`, `docs/custom-images.md`,
   `docs/architecture.md`, `docs/qemu.md`, `docs/backends.md`
 - Gondolin `builtin-image-registry.json` and `images/alpine-base.json`
+
+## stagex
+
+Reviewed 2026-09-22.
+
+| Project | Reviewed at | What it is |
+|---------|-------------|------------|
+| [stagex](https://codeberg.org/stagex/stagex) | release 2026.06.0, whitepaper draft of March 2026 | A full-source bootstrapped, mandatory-reproducible, multi-signed Linux distribution whose packages are OCI images built from Containerfiles |
+
+stagex is not an agent sandbox. It is reviewed here because its authors
+argue that Containerfiles plus OCI are a better base than Guix or Nix, on
+the grounds that OCI has many builders, that no single toolchain then
+needs deep review, and that far more people read Dockerfiles than Scheme.
+That argument shaped `VISION.md`.
+
+### What it does
+
+- Bootstraps from a 181-byte hex0 seed through live-bootstrap to a
+  modern LLVM and musl toolchain, the same stage0 lineage Guix uses.
+- Rejects any package that does not reproduce bit for bit. Every
+  Containerfile pins its source by sha256, disables the network during
+  the build, fixes the source date, and writes the OCI output with
+  rewritten timestamps.
+- Signs nothing until two independent maintainers have rebuilt it to the
+  same digest. Signatures are PGP over the manifest digest and live in a
+  separate repository. Every commit and merge is signed with hardware
+  keys.
+- Ships about 480 package recipes in four tiers: bootstrap, core, pallet,
+  user. Pallets assemble a working runtime by copying the packages a
+  toolchain needs into one image by hand.
+
+### Where it is stronger
+
+- Reproducibility as a hard gate rather than a goal.
+- A two-party quorum before publication, which neither Guix nor Nix has.
+- Recipes a Docker user can read in a minute.
+
+### Where it is weaker
+
+- The dependency graph exists only as `COPY --from` lines. There is no
+  graph or tree tool, dependencies are build-time only, and a package
+  image carries no runtime closure, so nothing checks that a pallet is
+  complete.
+- Only Docker with the containerd image store reproduces its digests, and
+  only as root. buildah and podman are listed as coming soon, so the
+  "many builders" argument is aspirational for stagex itself.
+- x86_64 only. arm64 fixes have been open since February 2026 and riscv64
+  fixes since September 2026, while Guix ships aarch64 with substitutes.
+- musl by default, which breaks manylinux wheels and prebuilt npm native
+  modules that an agent will install constantly. glibc exists in the user
+  tier but the language pallets are musl.
+
+### What we take from it
+
+- Reproducibility as a gate, two-party reproduction before signing, and
+  signatures kept in a repository. These are steps 4 and 5 of
+  `VISION.md`.
+- Not the Containerfile substrate, and not stagex as a backend. Possibly
+  stagex images as a verified base once arm64 ships and a second builder
+  reproduces them.
+
+### Sources
+
+- stagex README, `Makefile`, `src/targets.py`, `src/impact.py`,
+  `src/fetch.py`, `src/sign.sh`, `packages/core/git/Containerfile` and
+  `package.toml`, `packages/pallet/rust/Containerfile`, `digests/`
+- stagex issue 1708 (rootless builds change digests) and the open arm64
+  and riscv64 pull requests
+- Livaja, Vick, Heywood, Grove, "StageX: Eliminating Single Points of
+  Failure in Linux Distributions", draft, March 2026,
+  <https://codeberg.org/stagex/whitepapers/src/branch/main/out/stagex.pdf>
