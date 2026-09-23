@@ -92,13 +92,15 @@
             src = ./.;
             filter = path: _type:
               let rel = lib.removePrefix (toString ./. + "/") (toString path);
-              in lib.hasPrefix "cli" rel || rel == "config" || rel == "config/seccomp.json";
+              in lib.hasPrefix "cli" rel || rel == "config" || rel == "config/seccomp.json"
+                 || rel == "guix" || rel == "guix/holocronix" || rel == "guix/holocronix/query.scm";
           };
           nativeBuildInputs = [ pkgs.makeWrapper ];
           installPhase = ''
             mkdir -p $out/bin $out/share/jedi
             install -m 755 $src/cli/jedi.py $out/bin/jedi
             install -m 644 $src/config/seccomp.json $out/share/jedi/seccomp.json
+            install -m 644 $src/guix/holocronix/query.scm $out/share/jedi/query.scm
             wrapProgram $out/bin/jedi \
               --prefix PATH : ${pkgs.lib.makeBinPath [ jediPython ]} \
               --set JEDI_DATA_DIR $out/share/jedi

@@ -390,3 +390,60 @@ own signing chain is broken on main.
 - **No agents.** The Guix image ships the base tools and the project
   toolchain, but claude-code and the others are not packaged for Guix yet,
   so a Guix cave cannot run an agent.
+
+## Sub-problem 5: asking the model
+
+Goal: let an agent, or a script, ask the Guix package model a question and
+get a JSON answer, instead of reading Scheme and guessing. This is step 2
+of `VISION.md`: expose the model through tools before teaching anyone to
+read the source.
+
+`guix/holocronix/query.scm` is a script run under `guix repl`. `jedi guix`
+wraps it:
+
+```sh
+jedi guix show hello                 # the record: source, inputs, arguments
+jedi guix inputs hello --implicit    # what the build system adds (the bag)
+jedi guix derivation hello           # .drv path, output paths, built or not
+jedi guix plan hello                 # what a build would build or download
+jedi guix references ITEM            # run-time references of a built item
+jedi guix referrers ITEM             # what refers to a built item
+jedi guix size hello coreutils       # closure sizes, store or substitutes
+jedi guix graph hello -t bag --depth 1   # nodes and edges of a slice
+jedi guix lint hello                 # local checkers; --network for the rest
+jedi guix search '^ripgrep'          # name, synopsis, description regexp
+jedi guix classify git               # pure-record, custom-arguments, has-phases
+```
+
+`SPEC` is what `guix build` takes, `hello` or `hello@2.12`, or a Scheme
+expression in parentheses such as `'(@ (gnu packages base) hello)'`.
+`ITEM` is a spec or a `/gnu/store` path.
+
+The contract:
+
+- One JSON object on stdout, exit 0. On failure, `{"error": "..."}` on
+  stdout and exit 1, so a caller never parses stderr. The daemon's
+  substituter still chats on stderr during `plan`.
+- Nothing is ever built. `plan` asks the daemon and the substitute servers
+  what a build would do and stops there.
+- `--cave NAME` runs the query under that cave's `channels.scm` through
+  `guix time-machine`, so the answer describes the Guix the cave builds
+  with. Without it, the `guix` on `PATH` answers.
+- `--system` and `--target` apply to `inputs`, `derivation`, `plan` and
+  `graph`, which is how to see what a cross-compiled package needs.
+
+Which ops need the daemon: `derivation`, `plan`, `references`,
+`referrers`, `size`, `graph` with any type but `package`, and `lint` when
+the `derivation` or `profile-collisions` checkers run. `show`, `inputs`,
+`search`, `classify` and `graph -t package` need only the package modules.
+
+`classify` is the has-phases metric from `VISION.md`: a package is
+`pure-record` when its `arguments` are empty, `custom-arguments` when they
+set flags but no phases, and `has-phases` when it modifies phases, which is
+where a definition stops being data.
+
+Directly, without `jedi`:
+
+```sh
+guix repl -L guix -- guix/holocronix/query.scm show hello
+```

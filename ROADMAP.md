@@ -5,7 +5,8 @@
 Holocronix currently uses Nix to bake OCI container images. The plan is
 to add Guix as a second "baking" backend so that caves can be built with
 either Nix or Guix. The CLI, compose layer, firewall, and git handoff
-are already backend-agnostic.
+are already backend-agnostic. The direction this serves, and the order
+of the steps after the backend itself, is in `VISION.md`.
 
 ### Status
 
@@ -21,6 +22,7 @@ usage.
 | Image config: user, workdir, env, file ownership | Done. `jedicave-image` in `guix/holocronix/jedicave.scm` on a forked docker builder with `#:user`, `#:working-dir`, `#:owners`. Verified on `examples/hello-rust/cave.scm`. |
 | CLI backend selection | Done. `jedi init --backend guix` scaffolds `cave.scm` + `channels.scm`; `build`, `update`, `inputs` dispatch on which file the cave has. |
 | Agent tooling packaged for Guix | Planned. The Guix image has no agents yet. |
+| Agent-facing model queries | Done. `jedi guix show|inputs|derivation|plan|references|referrers|size|graph|lint|search|classify` answer as JSON from `guix/holocronix/query.scm`; `--cave` runs under the cave's pinned channels. Step 2 of `VISION.md`. |
 
 ### Architecture
 

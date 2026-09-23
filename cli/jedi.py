@@ -1211,6 +1211,187 @@ def _write_compose(d: Path, name: str, policy: dict) -> None:
                     (d / log_path).parent.mkdir(parents=True, exist_ok=True)
 
 
+# --- Guix model queries ---
+#
+# `jedi guix <op>` answers questions about the Guix package model as JSON by
+# running guix/holocronix/query.scm under `guix repl`.  Nothing is built.
+# With --cave the query runs under that cave's pinned channels, so the
+# answer is about the Guix the cave builds with, not the one on PATH.
+
+guix_app = typer.Typer(
+    name="guix",
+    help="Ask the Guix package model, as JSON: records, inputs, derivations, closures, graphs, lint.",
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+)
+app.add_typer(guix_app, name="guix")
+
+SpecArg = Annotated[str, typer.Argument(
+    help="Package spec as guix build takes it (hello, hello@2.12), or a Scheme expression in parentheses")]
+ItemArg = Annotated[str, typer.Argument(help="Package spec or /gnu/store path")]
+CaveOpt = Annotated[Optional[str], typer.Option(
+    "--cave", "-c", help="Run under this Guix cave's pinned channels",
+    autocompletion=complete_cave_name)]
+SystemOpt = Annotated[Optional[str], typer.Option(
+    "--system", help="Guix system type, e.g. aarch64-linux")]
+TargetOpt = Annotated[Optional[str], typer.Option(
+    "--target", help="Cross-compilation target triplet, e.g. aarch64-linux-gnu")]
+
+
+def _query_script() -> Path:
+    """query.scm from the local checkout, beside this file, or installed."""
+    here = Path(__file__).resolve().parent
+    candidates = [
+        (_holocronix_dir() or here.parent) / "guix" / "holocronix" / "query.scm",
+        here.parent / "guix" / "holocronix" / "query.scm",
+        DATA_DIR / "query.scm",                 # the installed jedi's share dir
+        here.parent / "share" / "jedi" / "query.scm",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    err_console.print("[red]query.scm not found.[/] Set HOLOCRONIX_DIR to a holocronix checkout")
+    raise typer.Exit(1)
+
+
+def _guix_query(cave: str | None, op: str, *args: str,
+                system: str | None = None, target: str | None = None) -> None:
+    """Run one query op and exit with its status; the JSON goes to stdout."""
+    if not shutil.which("guix"):
+        err_console.print("[red]guix not found on PATH[/] (https://guix.gnu.org/download/)")
+        raise typer.Exit(1)
+    script = _query_script()
+    opts = [a for a in args if a]
+    if system:
+        opts.append(f"--system={system}")
+    if target:
+        opts.append(f"--target={target}")
+    cwd: Path | None = None
+    if cave:
+        name, d = resolve_cave(cave)
+        if cave_backend(d) != "guix":
+            err_console.print(f"[red]Cave '{name}' is not a Guix cave[/]")
+            raise typer.Exit(1)
+        cmd = _guix_cmd(d, "repl", *_guix_load_path_args(), "--", str(script), op, *opts)
+        cwd = d
+    else:
+        cmd = ["guix", "repl", *_guix_load_path_args(), "--", str(script), op, *opts]
+    result = subprocess.run(cmd, cwd=cwd)
+    raise typer.Exit(result.returncode)
+
+
+@guix_app.command("show")
+def guix_show(spec: SpecArg, cave: CaveOpt = None):
+    """The package record: source, inputs, arguments, location."""
+    _guix_query(cave, "show", spec)
+
+
+@guix_app.command("inputs")
+def guix_inputs(
+    spec: SpecArg,
+    implicit: Annotated[bool, typer.Option("--implicit", help="The bag: build, host and target inputs, implicit ones included")] = False,
+    cave: CaveOpt = None,
+    system: SystemOpt = None,
+    target: TargetOpt = None,
+):
+    """Explicit inputs, or with --implicit everything the build system adds."""
+    _guix_query(cave, "inputs", spec, "--implicit" if implicit else "",
+                system=system, target=target)
+
+
+@guix_app.command("derivation")
+def guix_derivation(
+    spec: SpecArg,
+    no_grafts: Annotated[bool, typer.Option("--no-grafts", help="The ungrafted derivation")] = False,
+    cave: CaveOpt = None,
+    system: SystemOpt = None,
+    target: TargetOpt = None,
+):
+    """Derivation path and output paths, and whether each output is built."""
+    _guix_query(cave, "derivation", spec, "--no-grafts" if no_grafts else "",
+                system=system, target=target)
+
+
+@guix_app.command("plan")
+def guix_plan(
+    spec: SpecArg,
+    no_substitutes: Annotated[bool, typer.Option("--no-substitutes", help="Do not ask substitute servers")] = False,
+    no_grafts: Annotated[bool, typer.Option("--no-grafts", help="Plan the ungrafted build")] = False,
+    cave: CaveOpt = None,
+    system: SystemOpt = None,
+    target: TargetOpt = None,
+):
+    """What a build would build or download. Nothing is built."""
+    _guix_query(cave, "plan", spec,
+                "--no-substitutes" if no_substitutes else "",
+                "--no-grafts" if no_grafts else "",
+                system=system, target=target)
+
+
+@guix_app.command("references")
+def guix_references(item: ItemArg, cave: CaveOpt = None):
+    """Run-time references of a built store item or package."""
+    _guix_query(cave, "references", item)
+
+
+@guix_app.command("referrers")
+def guix_referrers(item: ItemArg, cave: CaveOpt = None):
+    """What in the store refers to a built item."""
+    _guix_query(cave, "referrers", item)
+
+
+@guix_app.command("size")
+def guix_size(
+    items: Annotated[list[str], typer.Argument(help="Package specs or /gnu/store paths")],
+    cave: CaveOpt = None,
+):
+    """Closure sizes, from the local store or substitute information."""
+    _guix_query(cave, "size", *items)
+
+
+@guix_app.command("graph")
+def guix_graph(
+    spec: SpecArg,
+    kind: Annotated[str, typer.Option("--type", "-t", help="package, bag, bag-emerged, bag-with-origins, reverse-package, reverse-bag, derivation, references, referrers, module")] = "package",
+    depth: Annotated[Optional[int], typer.Option("--depth", help="Stop this many edges away from SPEC")] = None,
+    cave: CaveOpt = None,
+    system: SystemOpt = None,
+    target: TargetOpt = None,
+):
+    """Nodes and edges of a graph slice, as guix graph would draw it."""
+    _guix_query(cave, "graph", spec, f"--type={kind}",
+                f"--depth={depth}" if depth is not None else "",
+                system=system, target=target)
+
+
+@guix_app.command("lint")
+def guix_lint(
+    spec: SpecArg,
+    network: Annotated[bool, typer.Option("--network", help="Also run the checkers that need the network")] = False,
+    checkers: Annotated[Optional[str], typer.Option("--checkers", help="Comma-separated checker names")] = None,
+    cave: CaveOpt = None,
+):
+    """Lint warnings, local checkers by default."""
+    _guix_query(cave, "lint", spec, "--network" if network else "",
+                f"--checkers={checkers}" if checkers else "")
+
+
+@guix_app.command("search")
+def guix_search(
+    pattern: Annotated[str, typer.Argument(help="Regexp matched against name, synopsis and description")],
+    limit: Annotated[int, typer.Option("--limit", help="Most packages to list")] = 50,
+    cave: CaveOpt = None,
+):
+    """Packages matching a regexp."""
+    _guix_query(cave, "search", pattern, f"--limit={limit}")
+
+
+@guix_app.command("classify")
+def guix_classify(spec: SpecArg, cave: CaveOpt = None):
+    """pure-record, custom-arguments, or has-phases."""
+    _guix_query(cave, "classify", spec)
+
+
 # --- Commands ---
 
 @app.command()
