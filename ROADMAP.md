@@ -17,7 +17,7 @@ usage.
 | Sub-problem | State |
 |-------------|-------|
 | Baked Rust dependencies (crates.io) | Done. `cargo build` works offline in a `guix pack -f docker` image. |
-| Baked Rust dependencies (git sources) | Done, on a local fixture workspace. Not yet tried on xous-core, dc34-api, or libtropic-rs. |
+| Baked Rust dependencies (git sources) | Done. Verified on a local fixture workspace and, to derivation level, on xous-core's two lockfiles (769 crates, 13 git repos). Each checkout gets its own vendor directory, since one crate name and version may come from several sources. `jedi lock` pins every git commit's hash in `vendor.lock.scm` via `guix download --git`, so no hash is ever copied by hand. |
 | Xous cross toolchain in the image | Done. baobit's `rust-xous-toolchain` via load path under baobit's pinned Guix; std hello world cross-compiles offline. Channel form blocked by baobit's broken channel auth. |
 | Image config: user, workdir, env, file ownership | Done. `jedicave-image` in `guix/holocronix/jedicave.scm` on a forked docker builder with `#:user`, `#:working-dir`, `#:owners`. Verified on `examples/hello-rust/cave.scm`. |
 | CLI backend selection | Done. `jedi init --backend guix` scaffolds `cave.scm` + `channels.scm`; `build`, `update`, `inputs` dispatch on which file the cave has. |

@@ -21,12 +21,25 @@ Module: `holocronix/cargo-vendor.scm`, exporting `cargo-vendor`.
 
 returns a Guix package whose output holds:
 
-- `vendor/<name>-<version>/` for every dependency in the lockfile, each with
-  the stub `.cargo-checksum.json` cargo expects from a directory source;
-- `share/cargo-config/config.toml` that redirects `crates-io` and every git
-  source to that directory and sets `net.offline = true`.
+- `vendor/<name>-<version>/` for every crates.io dependency in the lockfile,
+  each with the stub `.cargo-checksum.json` cargo expects from a directory
+  source;
+- `git-sources/<repo>-<commit>/<name>-<version>/` for every git dependency,
+  one directory per checkout;
+- `share/cargo-config/config.toml` that redirects `crates-io` to `vendor/`
+  and every git source to its checkout's directory, and sets
+  `net.offline = true`.
 
-The approach mirrors nixpkgs' `importCargoLock`.
+The approach mirrors nixpkgs' `importCargoLock`. The lockfile argument may
+also be a list, for a project with more than one workspace (xous-core has
+`Cargo.lock` and `locales/Cargo.lock`): one config.toml then covers them
+all, which matters because only one can be in effect.
+
+Why a directory per checkout rather than one shared `vendor/`: a cargo
+directory source holds each crate name and version once, yet a lockfile may
+take the same name and version from several sources at once. xous-core has
+eleven such pairs, `curve25519-dalek-derive 0.1.1` from both crates.io and
+a fork among them. Cargo's own vendoring splits them the same way.
 
 ### crates.io dependencies
 
@@ -40,7 +53,8 @@ packaged via `(gnu packages rust-crates)` and are substitutable.
 
 For a `git+URL?branch=...#COMMIT` source, the crate is located inside a
 checkout of that repository by the `name` in its `[package]` table and copied
-to `vendor/<name>-<version>/`. When the crate belongs to a cargo workspace,
+to `git-sources/<repo>-<commit>/<name>-<version>/`. When the crate belongs to
+a cargo workspace,
 its manifest is rewritten so `workspace = true` fields carry the concrete
 values from the workspace root (`aux-files/replace-workspace-values.py`, the
 nixpkgs script, run with Python and tomli-w at build time only). Without
@@ -60,8 +74,22 @@ Where the checkout comes from, in order of precedence:
 ```
 
 Option 2 is what a committed cave definition should use: reproducible and
-substitutable. Option 3 is convenient while iterating. Option 1 exists for
-fixtures and pre-fetched sources.
+substitutable. `jedi lock` produces it. For each git source in the cave's
+lockfiles it runs `guix download --git --commit=COMMIT URL`, which fetches
+the checkout into the store and prints its hash, and writes the alist to
+`<cave>/vendor.lock.scm`. `read-vendor-lock` loads that file:
+
+```scheme
+(cargo-vendor "my-project" "/path/to/Cargo.lock"
+  #:git-hashes (read-vendor-lock (dirname (current-filename))))
+```
+
+`(current-filename)` is the cave.scm being evaluated, so the lock file is
+found next to it whatever the working directory. A missing file reads as
+the empty list, so a project without git dependencies never needs one: the
+crates.io checksums in `Cargo.lock` are all it takes. Option 3 is
+convenient while iterating. Option 1 exists for fixtures and pre-fetched
+sources.
 
 ### Try it
 
@@ -262,11 +290,12 @@ base set includes gcc-toolchain, python, node, and rust.
 Goal: a Guix cave managed by the same commands as a Nix cave.
 
 A cave is Nix-backed when it holds a `flake.nix`, Guix-backed when it holds
-a `cave.scm`. Only three commands care:
+a `cave.scm`. Only these commands care:
 
 | Command | Nix | Guix |
 |---|---|---|
 | `jedi init` | writes `flake.nix` | `--backend guix` writes `cave.scm` and `channels.scm` |
+| `jedi lock` | n/a | pins the git sources of the seeded `Cargo.lock`s in `vendor.lock.scm` |
 | `jedi build` | `nix build .#container` | `guix time-machine -C channels.scm -- build -f cave.scm --root=result` |
 | `jedi update` | `nix flake update` | re-pins `channels.scm` from `guix describe` |
 | `jedi inputs` | flake input table | channel table |
@@ -278,10 +307,38 @@ Both end with `docker load` of the cave's own image, so `seed`, `up`,
 ```sh
 jedi init --backend guix my-cave
 $EDITOR ~/.config/jedicaves/my-cave/cave.scm   # add packages, cargo-vendor
-jedi build my-cave
 jedi seed ~/code/my-project my-cave
+jedi lock my-cave       # only if Cargo.lock has git sources
+jedi build my-cave
 jedi up my-cave && jedi enter my-cave
 ```
+
+### Locking git dependencies
+
+`jedi lock` is the one step of the workflow that touches the network, and
+it is only needed when a `Cargo.lock` has git sources. It scans every
+tracked `Cargo.lock` in the cave's seeded repos, read from their host
+working trees, which is what `cave.scm` points at too, or the files given
+with `--lockfile`. For each repository and commit not already recorded it
+lists what it is about to fetch, asks (`--yes` skips that), runs
+`guix download --git --commit=COMMIT URL`, and appends the hash to
+`<cave>/vendor.lock.scm` as it goes, so an interrupted run resumes where it
+stopped. Re-run it after a `Cargo.lock` change; already-pinned commits are
+not fetched again, and entries for commits no longer in the scanned
+lockfiles are kept, since another lockfile may still want them.
+
+The lock file is the git-dependency half of `flake.lock`: `cave.scm` says
+which lockfiles to vendor, `vendor.lock.scm` says what their git sources
+resolved to, and both are committed. The checkout is what `git-fetch` will
+verify against that hash at build time, so a wrong or altered checkout
+fails the build rather than being used.
+
+The fetch happens once. A fixed-output store path is a function of the
+content hash and the name, and the `git-fetch` origin `cargo-vendor` builds
+is named exactly as `guix download --git` names its result,
+`<repo>-<commit7>`, so the checkout `jedi lock` put in the store is already
+that origin's output and `jedi build` downloads nothing. On another
+machine, or after `guix gc`, the origin fetches and verifies it itself.
 
 ### Pinning
 
@@ -374,10 +431,9 @@ own signing chain is broken on main.
 
 ### Known limits
 
-- **Same crate from two git sources.** xous-core's lockfile lists `com_rs`
-  twice, once via `?branch=main` and once via `?rev=...`, same commit. Both
-  map to the same `vendor/<name>-<version>/`; the second copy overwrites the
-  first. Harmless when the commit is the same, untested otherwise.
+- **Git submodules.** A checkout is fetched non-recursively, by `jedi lock`
+  and by the `git-fetch` origin alike, so a git dependency whose crate needs
+  a submodule is incomplete. cargo itself does fetch them.
 - **Crates needing files outside their directory** (a `build.rs` reading
   `../something`) break, as they do with `cargo vendor` and nixpkgs.
 - **Alternate registries** (`sparse+` or `registry+` other than crates.io)

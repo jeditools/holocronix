@@ -14,17 +14,28 @@
 ;;;   * each crate is unpacked to vendor/<name>-<version>/ with a stub
 ;;;     .cargo-checksum.json carrying that checksum, which is all cargo
 ;;;     verifies for a "directory" source;
-;;;   * git entries are copied out of a checkout of their repository.  When
-;;;     the crate lives in a cargo workspace, `workspace = true' manifest
-;;;     fields are replaced by the concrete values (aux-files/
+;;;   * git entries are copied out of a checkout of their repository into
+;;;     git-sources/<repo>-<commit>/<name>-<version>/, one directory per
+;;;     checkout.  When the crate lives in a cargo workspace, `workspace =
+;;;     true' manifest fields are replaced by the concrete values (aux-files/
 ;;;     replace-workspace-values.py, from nixpkgs), because the workspace
 ;;;     root is not there to inherit from once the crate stands alone;
-;;;   * share/cargo-config/config.toml redirects crates-io and every git
-;;;     source to that directory.
+;;;   * share/cargo-config/config.toml redirects crates-io to vendor/ and
+;;;     every git source to its checkout's directory.
+;;;
+;;; Why a directory per checkout rather than one shared vendor/: a cargo
+;;; directory source holds each crate name and version once, yet a lockfile
+;;; may take the same name and version from several sources at once --
+;;; xous-core has curve25519-dalek-derive 0.1.1 from both crates.io and a
+;;; fork.  Cargo's own vendoring splits them the same way.
 ;;;
 ;;; Path dependencies between crates of one git workspace need no rewriting:
 ;;; cargo resolves a `path' dependency of a non-path source by name and
 ;;; version within that same source.
+;;;
+;;; The content hash a git entry needs is what `jedi lock' produces, with
+;;; `guix download --git', into vendor.lock.scm; `read-vendor-lock' below
+;;; loads that file for #:git-hashes.
 
 (define-module (holocronix cargo-vendor)
   #:use-module (guix gexp)
@@ -53,6 +64,7 @@
             lock-package-version
             lock-package-source
             lock-package-checksum
+            read-vendor-lock
             cargo-vendor))
 
 
@@ -195,6 +207,29 @@ Lockfile version 4 percent-encodes VALUE."
                           raw))))
     (git-source spec url kind value commit)))
 
+(define (source-identity source)
+  "Return a string identifying what SOURCE, taken from Cargo.lock, resolves
+to.  One git dependency may be spelled two ways -- ?branch=main here,
+?rev=COMMIT there -- while pinning the same commit of the same repository: the
+query is how it was asked for, the commit after # is what was found.  Sources
+agreeing here are one checkout and are vendored once; sources differing are
+vendored separately, even when they carry the same crate name and version.
+The query value is not decoded, playing no part in identity."
+  (if (string-prefix? "git+" source)
+      (let ((parsed (parse-git-source source 1)))
+        (string-append "git+" (git-source-url parsed)
+                       "#" (git-source-commit parsed)))
+      source))
+
+(define (git-source-directory-name source)
+  "Return the name of the vendor subdirectory holding SOURCE's crates, also
+used as the store name of its checkout: the repository name and the start of
+the commit, unique per checkout and still saying at a glance which fork a
+crate came from.  It is `url+commit->name' from (guix git), the very
+function `guix download --git' names its result with, so the checkout `jedi
+lock' fetches is the store item the build wants, by construction."
+  (url+commit->name (git-source-url source) (git-source-commit source)))
+
 (define (git-source-checkout source git-checkouts git-hashes)
   "Return a file-like object holding a checkout of SOURCE.  GIT-CHECKOUTS
 overrides, keyed by commit or by URL, win; then GIT-HASHES, keyed by commit,
@@ -211,8 +246,12 @@ fetched at build time with no hash."
            (origin
              (method git-fetch)
              (uri (git-reference (url url) (commit commit)))
-             (file-name (string-append "cargo-git-" (string-take commit 7)
-                                       "-checkout"))
+             ;; Named exactly as `guix download --git' names its result: a
+             ;; fixed-output store path is a function of the hash and the
+             ;; name, so with the same name the checkout `jedi lock' fetched
+             ;; is this origin's output already, and the build fetches
+             ;; nothing.
+             (file-name (git-source-directory-name source))
              (sha256 (nix-base32-string->bytevector hash)))))
      (else
       (git-checkout (url url) (commit commit))))))
@@ -222,17 +261,31 @@ fetched at build time with no hash."
 ;;; Vendor directory.
 ;;;
 
+(define (aux-file name)
+  "Return NAME under holocronix/aux-files/ as a file-like object, found
+through the load path.  Not `local-file' with a relative name: that resolves
+against this file's source location, which is lost when the module runs from
+source rather than a compiled .go, as it does under `jedi build -L'."
+  (let ((file (search-path %load-path
+                           (string-append "holocronix/aux-files/" name))))
+    (unless file
+      (error "cargo-vendor: auxiliary file not on the load path:" name))
+    ;; A relative `-L guix' yields a relative hit; make it absolute here,
+    ;; while the working directory is still the one it is relative to.
+    (local-file (canonicalize-path file))))
+
 (define (vendor-builder project crates git-packages git-specs offline?)
-  "Return a gexp that populates the output with vendor/ and
+  "Return a gexp that populates the output with vendor/, git-sources/ and
 share/cargo-config/config.toml.  CRATES is a list of
-(name version checksum origin); GIT-PACKAGES a list of
-(name version checkout); GIT-SPECS a list of (spec url kind value) for the
-config, one per distinct git source."
+(name version checksum origin), vendored into vendor/; GIT-PACKAGES a list of
+(name version checkout directory), vendored into git-sources/DIRECTORY;
+GIT-SPECS a list of (spec url kind value directory) for the config, one per
+distinct git source."
   (define git-tools
     ;; Only pull Python into the build when there is something to rewrite.
     (and (not (null? git-packages))
          #~(list #+(file-append python "/bin/python3")
-                 #+(local-file "aux-files/replace-workspace-values.py")
+                 #+(aux-file "replace-workspace-values.py")
                  #+python-tomli-w)))
 
   (with-imported-modules '((guix build utils))
@@ -338,11 +391,13 @@ config, one per distinct git source."
 
         (for-each
          (match-lambda
-           ((name version checkout)
+           ((name version checkout directory)
             (let* ((manifest (find-crate-manifest checkout name version))
                    (src (dirname manifest))
-                   (dir (string-append vendor "/" name "-" version)))
+                   (dir (string-append out "/git-sources/" directory
+                                       "/" name "-" version)))
               (format #t "vendoring ~a ~a from ~a~%" name version src)
+              (mkdir-p (dirname dir))
               (copy-recursively src dir #:log (%make-void-port "w"))
               (invoke "chmod" "-R" "u+w" dir)
               (when (mentions-workspace? (string-append dir "/Cargo.toml"))
@@ -364,8 +419,8 @@ was found above ~a~%" name src))))
                 (lambda (port)
                   (display "{\"files\":{},\"package\":null}" port))))))
          (list #$@(map (match-lambda
-                         ((name version checkout)
-                          #~(list #$name #$version #$checkout)))
+                         ((name version checkout directory)
+                          #~(list #$name #$version #$checkout #$directory)))
                        git-packages)))
 
         ;; Cargo config: crates-io and each git source replaced by vendor/.
@@ -383,50 +438,139 @@ replace-with = \"vendored-sources\"
 [source.vendored-sources]
 directory = ~s
 " vendor)
+              ;; Every git source is replaced by a directory of its own; the
+              ;; stanza defining that directory is shared by each spelling
+              ;; that resolves to it, so emit it once.
               (for-each
                (match-lambda
-                 ((spec url kind value)
+                 ((spec url kind value directory)
                   (format port "~%[source.~s]~%git = ~s~%" spec url)
                   (when kind
                     (format port "~a = ~s~%" kind value))
-                  (display "replace-with = \"vendored-sources\"\n" port)))
-               '#$git-specs)))))))
+                  (format port "replace-with = ~s~%"
+                          (string-append "vendored-" directory))))
+               '#$git-specs)
+              (for-each
+               (lambda (directory)
+                 (format port "~%[source.~s]~%directory = ~s~%"
+                         (string-append "vendored-" directory)
+                         (string-append out "/git-sources/" directory)))
+               (delete-duplicates
+                (map (match-lambda
+                       ((spec url kind value directory) directory))
+                     '#$git-specs)))))))))
+
+(define (read-vendor-lock directory)
+  "Return the alist `jedi lock' wrote to DIRECTORY/vendor.lock.scm, in the
+shape #:git-hashes takes, or the empty list when there is no such file: a
+project without git dependencies never needs one.  DIRECTORY is normally
+(dirname (current-filename)) in a cave.scm, the directory of that very file."
+  (let ((file (string-append directory "/vendor.lock.scm")))
+    (if (file-exists? file)
+        (let ((alist (call-with-input-file file read)))
+          (unless (and (list? alist)
+                       (every (lambda (entry)
+                                (and (pair? entry)
+                                     (string? (car entry))
+                                     (string? (cdr entry))))
+                              alist))
+            (error (string-append "read-vendor-lock: " file
+                                  ": expected an alist of commit to hash, got:")
+                   alist))
+          alist)
+        '())))
 
 (define* (cargo-vendor project lockfile
                        #:key (version "0") (offline? #t)
                        (git-checkouts '()) (git-hashes '()))
   "Return a package whose output holds a `cargo vendor'-style directory with
-every dependency listed in LOCKFILE, a path to a Cargo.lock, plus
-share/cargo-config/config.toml pointing cargo at it.  PROJECT names the
-project in the package name and config header.
+every dependency listed in LOCKFILE, plus share/cargo-config/config.toml
+pointing cargo at it.  PROJECT names the project in the package name and
+config header.
+
+LOCKFILE is the path to a Cargo.lock, or a list of them: a project with more
+than one workspace needs a single config.toml, since only one can be in
+effect.  A crate appearing in several lockfiles from the same source is
+vendored once; the same name and version from different sources is vendored
+once per source, each source having a directory of its own.
 
 With OFFLINE? true the config also sets net.offline so cargo never tries the
 network.
 
 Git dependencies are fetched as unhashed `git-checkout' objects by default.
 GIT-HASHES is an alist of commit to nix-base32 sha256 of the checkout; those
-commits become fixed-output `git-fetch' origins instead.  GIT-CHECKOUTS is an
-alist of commit or URL to a file-like object to use as the checkout, for
+commits become fixed-output `git-fetch' origins instead.  `jedi lock' writes
+such an alist to vendor.lock.scm, see `read-vendor-lock'.  GIT-CHECKOUTS is
+an alist of commit or URL to a file-like object to use as the checkout, for
 local fixtures or pre-fetched sources."
+  (define lockfiles
+    (if (string? lockfile) (list lockfile) lockfile))
+
   ;; Check before reading: opening a missing lockfile raises a bare ENOENT
   ;; that `guix build -f' reports as "failed to load 'cave.scm': No such file
   ;; or directory", which blames the wrong file entirely.
-  (unless (file-exists? lockfile)
-    (error (string-append "cargo-vendor: " project
-                          ": no such Cargo.lock:")
-           lockfile))
-  (let* ((lock-version (cargo-lock-version lockfile))
-         (deps (filter lock-package-source (read-cargo-lock lockfile)))
+  (for-each (lambda (file)
+              (unless (file-exists? file)
+                (error (string-append "cargo-vendor: " project
+                                      ": no such Cargo.lock:")
+                       file)))
+            lockfiles)
+
+  (define (merge-lockfiles)
+    ;; Return (ENTRIES . SPEC-ENTRIES).  ENTRIES is the dependencies across
+    ;; every lockfile, each paired with the format version of the file it came
+    ;; from (git source syntax differs), deduplicated by name, version and
+    ;; source: a crate occurring in several sources is kept once per source,
+    ;; since each source is vendored into a directory of its own.
+    ;; SPEC-ENTRIES is every distinct git source string seen, likewise paired.
+    ;; The two differ when one checkout is requested two ways -- see
+    ;; `source-identity' -- which calls for a single vendored copy but a
+    ;; [source] stanza for each spelling.
+    (let loop ((files lockfiles) (seen '()) (acc '()) (specs '()))
+      (match files
+        (() (cons (reverse acc) (reverse specs)))
+        ((file . rest)
+         (let ((lock-version (cargo-lock-version file)))
+           (let inner ((pkgs (filter lock-package-source
+                                     (read-cargo-lock file)))
+                       (seen seen)
+                       (acc acc)
+                       (specs specs))
+             (match pkgs
+               (() (loop rest seen acc specs))
+               ((pkg . more)
+                (let* ((source (lock-package-source pkg))
+                       (key (string-append (lock-package-name pkg) " "
+                                           (lock-package-version pkg) " "
+                                           (source-identity source)))
+                       (specs (if (and (git-package? pkg)
+                                       (not (assoc source specs)))
+                                  (cons (cons source lock-version) specs)
+                                  specs)))
+                  (if (member key seen)
+                      (inner more seen acc specs) ;already vendored
+                      (inner more
+                             (cons key seen)
+                             (cons (cons pkg lock-version) acc)
+                             specs)))))))))))
+
+  (let* ((merged (merge-lockfiles))
+         (entries (car merged))
+         (spec-entries (cdr merged))
+         (deps (map car entries))
          (registry (filter crates-io-package? deps))
          (git (filter git-package? deps))
          (unsupported (remove (lambda (pkg)
                                 (or (crates-io-package? pkg)
                                     (git-package? pkg)))
                               deps))
-         (sources (map (lambda (pkg)
-                         (parse-git-source (lock-package-source pkg)
-                                           lock-version))
-                       git))
+         (sources (filter-map (match-lambda
+                                ((pkg . lock-version)
+                                 (and (git-package? pkg)
+                                      (parse-git-source
+                                       (lock-package-source pkg)
+                                       lock-version))))
+                              entries))
          ;; One checkout per commit, shared by every crate of that repo.
          (checkouts
           (fold (lambda (source acc)
@@ -440,20 +584,42 @@ local fixtures or pre-fetched sources."
                               acc))))
                 '()
                 sources))
+         ;; Each checkout is vendored into a directory of its own, and gets a
+         ;; cargo directory source of its own.  One shared directory cannot
+         ;; work: a crate name and version may occur in several sources at
+         ;; once -- xous-core pulls curve25519-dalek-derive 0.1.1 from both
+         ;; crates.io and a fork -- and a directory source holds each name
+         ;; and version once.  Cargo's own vendoring splits them the same way.
+         (directories
+          (fold (lambda (source acc)
+                  (let ((commit (git-source-commit source)))
+                    (if (assoc-ref acc commit)
+                        acc
+                        (cons (cons commit (git-source-directory-name source))
+                              acc))))
+                '()
+                sources))
          (git-packages
           (map (lambda (pkg source)
-                 (list (lock-package-name pkg)
-                       (lock-package-version pkg)
-                       (assoc-ref checkouts (git-source-commit source))))
+                 (let ((commit (git-source-commit source)))
+                   (list (lock-package-name pkg)
+                         (lock-package-version pkg)
+                         (assoc-ref checkouts commit)
+                         (assoc-ref directories commit))))
                git sources))
+         ;; From every spelling seen, not just the vendored ones: a crate
+         ;; dropped as a duplicate still needs its source replaced.
          (git-specs
-          (delete-duplicates
-           (map (lambda (source)
-                  (list (git-source-spec source)
-                        (git-source-url source)
-                        (git-source-kind source)
-                        (git-source-value source)))
-                sources)))
+          (map (match-lambda
+                 ((spec . lock-version)
+                  (let ((source (parse-git-source spec lock-version)))
+                    (list (git-source-spec source)
+                          (git-source-url source)
+                          (git-source-kind source)
+                          (git-source-value source)
+                          (assoc-ref directories
+                                     (git-source-commit source))))))
+               spec-entries))
          ;; Built here on purpose: inside `package' below, `name' and
          ;; `version' refer to the record's own fields.
          (builder (vendor-builder project
