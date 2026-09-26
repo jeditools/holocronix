@@ -398,8 +398,11 @@ get a JSON answer, instead of reading Scheme and guessing. This is step 2
 of `VISION.md`: expose the model through tools before teaching anyone to
 read the source.
 
-`guix/holocronix/query.scm` is a script run under `guix repl`. `jedi guix`
-wraps it:
+`cli/query.scm` is a script run under `guix repl`. `jedi guix` wraps it.
+It lives beside `jedi.py` and not under `guix/` on purpose: `guix/` is the
+holocronix channel, and Guix loads every `.scm` file in a channel before
+compiling it, so a script there runs its entry point inside the channel
+build and fails it. Only modules belong under the channel directory.
 
 ```sh
 jedi guix show hello                 # the record: source, inputs, arguments
@@ -445,5 +448,5 @@ where a definition stops being data.
 Directly, without `jedi`:
 
 ```sh
-guix repl -L guix -- guix/holocronix/query.scm show hello
+guix repl -L guix -- cli/query.scm show hello
 ```

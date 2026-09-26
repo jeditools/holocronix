@@ -1214,9 +1214,13 @@ def _write_compose(d: Path, name: str, policy: dict) -> None:
 # --- Guix model queries ---
 #
 # `jedi guix <op>` answers questions about the Guix package model as JSON by
-# running guix/holocronix/query.scm under `guix repl`.  Nothing is built.
-# With --cave the query runs under that cave's pinned channels, so the
-# answer is about the Guix the cave builds with, not the one on PATH.
+# running cli/query.scm under `guix repl`.  Nothing is built.  With --cave
+# the query runs under that cave's pinned channels, so the answer is about
+# the Guix the cave builds with, not the one on PATH.
+#
+# query.scm lives beside this file, not under guix/: that directory is the
+# holocronix channel, and Guix loads every .scm in a channel before compiling
+# it, which would run the script's entry point and fail the channel build.
 
 guix_app = typer.Typer(
     name="guix",
@@ -1242,8 +1246,8 @@ def _query_script() -> Path:
     """query.scm from the local checkout, beside this file, or installed."""
     here = Path(__file__).resolve().parent
     candidates = [
-        (_holocronix_dir() or here.parent) / "guix" / "holocronix" / "query.scm",
-        here.parent / "guix" / "holocronix" / "query.scm",
+        (_holocronix_dir() or here.parent) / "cli" / "query.scm",
+        here / "query.scm",                     # running from the checkout
         DATA_DIR / "query.scm",                 # the installed jedi's share dir
         here.parent / "share" / "jedi" / "query.scm",
     ]

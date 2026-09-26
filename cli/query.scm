@@ -1,6 +1,12 @@
 ;;; query.scm --- JSON answers about the Guix package model, for agents.
 ;;;
-;;; Usage:  guix repl [-L DIR]... -- query.scm OP [ARG...] [--option[=value]]...
+;;; Usage:  guix repl [-L DIR]... -- cli/query.scm OP [ARG...] [--option[=value]]...
+;;;
+;;; This is a script, not a module, so it must stay out of guix/: that
+;;; directory is the holocronix channel, and Guix loads every .scm file in a
+;;; channel before compiling it.  Loaded that way, the call to `main' at the
+;;; bottom runs with the builder's command line, fails, and takes the whole
+;;; channel build down with it.
 ;;;
 ;;; Every invocation prints exactly one JSON object on stdout and exits 0, or
 ;;; prints {"error": "..."} on stdout and exits 1.  Nothing is ever built.
@@ -47,6 +53,7 @@
              (guix base32)
              (guix git-download)
              (guix utils)
+             (ice-9 format)             ; `fail' uses ~{ ~}, which core format lacks
              (ice-9 match)
              (ice-9 regex)
              (ice-9 pretty-print)

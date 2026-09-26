@@ -37,7 +37,7 @@ architecture. A failure comes back as `{"error": "..."}` with exit 1.
 Inside a cave without `jedi`, run the script directly:
 
 ```sh
-guix repl -L /path/to/holocronix/guix -- /path/to/holocronix/guix/holocronix/query.scm show hello
+guix repl -L /path/to/holocronix/guix -- /path/to/holocronix/cli/query.scm show hello
 ```
 
 ## Authoring workflow
