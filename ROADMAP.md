@@ -137,7 +137,11 @@ tools ships it. Layer by layer:
 - **Boundary: a hardware VM.** Firecracker is the strongest VMM: small,
   built for hostile multi-tenant workloads, with a jailer and seccomp.
   QEMU under Gondolin is a larger surface even with its trimmed device
-  set. gVisor and Kata sit below both.
+  set. Kata is also a hardware VM, using whichever of those VMMs it is
+  configured with, plus a guest agent and a shared-filesystem path for
+  the image; it is the one option that remains a Docker runtime. gVisor
+  is weaker than all of these: a user-space kernel that still runs on
+  the host kernel, not a hardware boundary.
 - **Network: no route out of the guest.** Every flow terminates in a
   host-side policy point that speaks HTTP and TLS and nothing else.
   Gondolin has this by construction. It is the biggest gap in our
