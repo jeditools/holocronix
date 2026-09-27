@@ -918,6 +918,7 @@ CAVE_SCM_TEMPLATE = """\
 ;; guix/README.md in holocronix for the full option list.
 
 (use-modules (holocronix jedicave)
+             (holocronix agents)
              (holocronix cargo-vendor)
              (gnu packages))
 
@@ -926,6 +927,14 @@ CAVE_SCM_TEMPLATE = """\
  ;; unique per cave: caves that share a name share a Docker tag, so building
  ;; one would replace the other's image.
  #:name "jedicave-{slug}"
+
+ ;; Coding agents, added to the profile.  The default,
+ ;; %jedicave-default-agents, is claude-code; '() makes a cave without
+ ;; agents.  Claude Code gets its settings from holocronix's
+ ;; config/defaults.json and its plugins from the marketplaces pinned in
+ ;; (holocronix claude); #:plugins adds more, as "name@marketplace".
+ ;; #:agents %jedicave-default-agents
+ ;; #:plugins '()
 
  ;; Project toolchain, added to the jedicave base tools
  ;; (%jedicave-base-specs).  Package specs as `guix install` takes them.

@@ -1,10 +1,10 @@
 ;;; holocronix --- sandboxed containers for coding agents
 ;;;
 ;;; (holocronix jedicave): build a jedicave Docker image with Guix.  This is
-;;; the Guix counterpart of lib/mkJediCave.nix: a profile of tools, an
-;;; entrypoint, /etc/passwd and friends, a home directory for the agent
-;;; user, root-only infrastructure tools, and the environment variables the
-;;; agent sees.
+;;; the Guix counterpart of lib/mkJediCave.nix: a profile of tools and
+;;; agents, an entrypoint, /etc/passwd and friends, a home directory for the
+;;; agent user, root-only infrastructure tools, Claude Code's settings and
+;;; plugin seed, and the environment variables the agent sees.
 ;;;
 ;;; `guix pack -f docker' cannot set the image user, working directory, or
 ;;; arbitrary environment variables, and it archives every file as root, so
@@ -24,6 +24,9 @@
   #:use-module (gnu packages compression)
   #:use-module (gnu packages gnupg)
   #:use-module (gnu packages guile)
+  #:use-module (gnu packages bootstrap)
+  #:use-module (holocronix agents)
+  #:use-module (holocronix claude)
   #:use-module (ice-9 match)
   #:use-module (srfi srfi-1)
   #:export (%jedicave-base-specs
@@ -147,6 +150,10 @@ exec sleep infinity
 ;;; Image.
 ;;;
 
+(define (claude-code? package)
+  "True if PACKAGE is Claude Code, whatever its version."
+  (string=? (package-name package) "claude-code"))
+
 (define (not-config? module)
   ;; Modules to import into the build side, like guix pack does: Guix's own
   ;; and ours, except (guix config) which is substituted by make-config.scm.
@@ -162,6 +169,9 @@ exec sleep infinity
                          (packages (specifications->packages
                                     %jedicave-base-specs))
                          (extra-packages '())
+                         (agents %jedicave-default-agents)
+                         (marketplaces %default-marketplaces)
+                         (plugins '())
                          (infra-packages (specifications->packages
                                           %jedicave-infra-specs))
                          (env '())
@@ -171,7 +181,7 @@ exec sleep infinity
                          (gid 1000)
                          (git-user "Yoda")
                          (git-email "yoda@jedicave.kyb")
-                         (claude? #f)
+                         (claude? (any claude-code? agents))
                          (claude-settings #f)
                          (project-setup "")
                          (extra-directives '())
@@ -186,9 +196,15 @@ exec sleep infinity
   "Return a file-like object: a gzip-compressed Docker image archive named
 NAME, loadable with `docker load'.
 
-PACKAGES plus EXTRA-PACKAGES form the agent's profile, linked at /bin and put
-on PATH.  INFRA-PACKAGES go to /usr/local/sbin, root-only.  ENV is an alist
-of extra environment variables; it overrides the defaults.  SYMLINKS is an
+PACKAGES plus EXTRA-PACKAGES plus AGENTS form the agent's profile, linked at
+/bin and put on PATH.  AGENTS are the coding agents, prebuilt binaries from
+(holocronix agents); when there are any, the image also gets the FHS dynamic
+linker path they ask for.  When one of them is Claude Code (CLAUDE?), its
+settings.json is CLAUDE-SETTINGS, or by default config/defaults.json with
+PLUGINS enabled, and the plugin seed directory holds MARKETPLACES with
+PLUGINS (\"name@marketplace\") pre-installed; see (holocronix claude).
+INFRA-PACKAGES go to /usr/local/sbin, root-only.  ENV is an alist of extra
+environment variables; it overrides the defaults.  SYMLINKS is an
 alist of (IMAGE-PATH . PROFILE-RELATIVE-TARGET), for instance
 (\"/.cargo\" . \"share/cargo-config\").  EXTRA-DIRECTIVES are appended to the
 populate directives (see 'evaluate-populate-directive').  COMPRESSOR is the
@@ -199,7 +215,7 @@ command compressing the archive; it must produce gzip output."
     (let ((profile-name (string-append name "-profile")))
       (profile
        (name profile-name)
-       (content (packages->manifest (append packages extra-packages)))
+       (content (packages->manifest (append packages extra-packages agents)))
        (allow-collisions? #t))))
 
   (define infra-profile
@@ -210,10 +226,39 @@ command compressing the archive; it must produce gzip output."
        (hooks '())
        (locales? #f))))
 
+  (define settings
+    ;; Claude Code's settings.json: the caller's, or defaults.json with the
+    ;; cave's plugins enabled.
+    (and claude?
+         (or claude-settings (claude-settings-file #:plugins plugins))))
+
+  (define seed
+    ;; CLAUDE_CODE_PLUGIN_SEED_DIR: marketplaces and pre-installed plugins.
+    (and claude?
+         (claude-plugin-seed #:marketplaces marketplaces #:plugins plugins)))
+
+  (define loader-directives
+    ;; Prebuilt agents ask for the FHS dynamic linker; point it at Guix's
+    ;; glibc, whose ld.so finds the rest of glibc on its own.  See
+    ;; (holocronix agents).  A symlink directive does not create parents.
+    (if (pair? agents)
+        (let ((interp (fhs-dynamic-linker)))
+          `((directory ,(dirname interp) 0 0 #o755)
+            (,interp -> ,(file-append glibc (glibc-dynamic-linker)))))
+        '()))
+
   (define entrypoint
     (jedicave-entrypoint #:claude? claude?
-                         #:claude-settings claude-settings
+                         #:claude-settings settings
                          #:project-setup project-setup))
+
+  (define graphs
+    ;; What goes into the image: the closures of these.
+    `(("profile" ,agent-profile)
+      ("infra" ,infra-profile)
+      ("entrypoint" ,entrypoint)
+      ,@(if (pair? agents) `(("loader" ,glibc)) '())
+      ,@(if seed `(("seed" ,seed)) '())))
 
   (define gitconfig
     (plain-file "gitconfig.local"
@@ -272,9 +317,7 @@ command compressing the archive; it must produce gzip output."
 
             (define paths
               (delete-duplicates
-               (append (closure "profile")
-                       (closure "infra")
-                       (closure "entrypoint"))))
+               (append-map closure '#$(map car graphs))))
 
             (define (in-profile file)
               (string-append profile-dir file))
@@ -397,6 +440,8 @@ command compressing the archive; it must produce gzip output."
                 ("/bin" -> ,(in-profile "/bin"))
                 (directory "/usr/bin")
                 ("/usr/bin/env" -> ,(in-profile "/bin/env"))
+                ;; FHS dynamic linker, for the prebuilt agents
+                ,@'#$loader-directives
                 ,@(map (match-lambda
                          ((path . target)
                           `(,path -> ,(string-append profile-dir "/" target))))
@@ -422,6 +467,14 @@ command compressing the archive; it must produce gzip output."
                 (file "/commandhistory/.bash_history" "")
                 (file "/commandhistory/.zsh_history" "")
                 (directory "/env/.claude")
+                ;; Claude Code: settings (a volume usually masks this copy;
+                ;; the entrypoint seeds the volume from the same file) and
+                ;; the read-only plugin seed
+                ,@(if #$claude?
+                      `((file "/env/.claude/settings.json"
+                              ,(read-file #$settings))
+                        ("/env/.claude-plugin-seed" -> #$seed))
+                      '())
                 ;; Root-only infrastructure tools
                 (directory "/usr/local/sbin" 0 0 #o750)
                 ,@(bin-symlinks "bin")
@@ -454,7 +507,4 @@ command compressing the archive; it must produce gzip output."
   (computed-file (string-append name "-docker-image.tar.gz")
                  build
                  #:options
-                 (list #:references-graphs
-                       `(("profile" ,agent-profile)
-                         ("infra" ,infra-profile)
-                         ("entrypoint" ,entrypoint)))))
+                 (list #:references-graphs graphs)))
