@@ -161,6 +161,7 @@ jedi down dagobah      # Stop
 
 | Command | Description | Requires `up`? |
 |---------|-------------|----------------|
+| `jedi --version` | Print the commit jedi was built from (`git describe` form) | — |
 | `jedi init <name>` | Create a new cave | — |
 | `jedi build [name]` | Build cave image | — |
 | `jedi build --update [input]` | Update flake inputs then build | — |

@@ -23,6 +23,14 @@
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
       lib = pkgs.lib;
+      # What `jedi --version` prints: the commit jedi is built from, as
+      # `git describe --always --dirty` shows it.  Nix only knows the commit
+      # when the flake was fetched as a git repo (`nix develop` in the
+      # checkout does); a plain path fetch carries no revision, so fall back
+      # to the modification stamp rather than print nothing.  The repo has
+      # no tags, so short hash plus "-dirty" is the whole describe output.
+      jediVersion = self.dirtyShortRev or self.shortRev
+        or "unknown-${self.lastModifiedDate or "0"}";
       defaultAgents = {
         inherit (llm-agents.packages.${system}) claude-code opencode qwen-code;
         # hermes-agent excluded — depends on litellm (supply chain compromise, 2026-03)
@@ -102,7 +110,8 @@
             install -m 644 $src/cli/query.scm $out/share/jedi/query.scm
             wrapProgram $out/bin/jedi \
               --prefix PATH : ${pkgs.lib.makeBinPath [ jediPython ]} \
-              --set JEDI_DATA_DIR $out/share/jedi
+              --set JEDI_DATA_DIR $out/share/jedi \
+              --set JEDI_VERSION ${lib.escapeShellArg jediVersion}
           '';
         };
       };

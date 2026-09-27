@@ -32,6 +32,38 @@ DATA_DIR = Path(os.environ.get("JEDI_DATA_DIR", Path(__file__).resolve().parent.
 COMPOSE_SERVICE = "shell"
 HOLOCRONIX_URL_DEFAULT = "github:jeditools/holocronix"
 
+
+def _jedi_version() -> str:
+    """The commit jedi was built from, as `git describe --always --dirty`
+    prints it: the short hash, with "-dirty" when the tree had uncommitted
+    changes.  The flake bakes it into the wrapper as JEDI_VERSION, so an
+    installed jedi reports the checkout it was built from, not whatever a
+    nearby working tree has since become.  Run straight from a checkout,
+    the script asks git."""
+    baked = os.environ.get("JEDI_VERSION")
+    if baked:
+        return baked
+    r = subprocess.run(
+        ["git", "-C", str(Path(__file__).resolve().parent),
+         "describe", "--always", "--dirty", "--tags"],
+        capture_output=True, text=True)
+    return r.stdout.strip() or "unknown"
+
+
+def _version_callback(value: bool) -> None:
+    if value:
+        typer.echo(f"jedi {_jedi_version()}")
+        raise typer.Exit()
+
+
+@app.callback()
+def _main(
+    version: Annotated[bool, typer.Option(
+        "--version", "-V", help="Print jedi's version (the commit it was built from) and exit",
+        callback=_version_callback, is_eager=True)] = False,
+):
+    pass
+
 # Image naming.  Every cave gets its own Docker repository, so building one
 # cave never replaces the image another cave runs.  Caves created before this
 # scheme shared LEGACY_IMAGE; `jedi up` adopts that image once, see
