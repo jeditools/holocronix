@@ -42,8 +42,9 @@ This is an early-stage project. Expect rough edges.
   that exposes a `devShells` output (or you can use `extraPackages` to
   add tools manually)
 - **Guix backend**: experimental. `jedi init --backend guix` builds a cave
-  with Guix, Rust dependencies baked in (`jedi lock` pins the git ones); no
-  agents are packaged for it yet. See `guix/README.md` and `ROADMAP.md`.
+  with Guix, Rust dependencies baked in (`jedi lock` pins the git ones), and
+  Claude Code with its settings and plugin seed; the other agents are not
+  packaged for it yet. See `guix/README.md` and `ROADMAP.md`.
 
 ## Naming
 

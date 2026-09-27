@@ -21,7 +21,7 @@ usage.
 | Xous cross toolchain in the image | Done. baobit's `rust-xous-toolchain` via load path under baobit's pinned Guix; std hello world cross-compiles offline. Channel form blocked by baobit's broken channel auth. |
 | Image config: user, workdir, env, file ownership | Done. `jedicave-image` in `guix/holocronix/jedicave.scm` on a forked docker builder with `#:user`, `#:working-dir`, `#:owners`. Verified on `examples/hello-rust/cave.scm`. |
 | CLI backend selection | Done. `jedi init --backend guix` scaffolds `cave.scm` + `channels.scm`; `build`, `update`, `inputs` dispatch on which file the cave has. |
-| Agent tooling packaged for Guix | Planned. The Guix image has no agents yet. |
+| Agent tooling packaged for Guix | In progress. Claude Code is packaged in `(holocronix agents)`, and a Guix cave ships it by default with its settings and the plugin seed from `(holocronix claude)`. opencode, kimi-code, qwen-code and ori are not packaged yet. |
 | Agent-facing model queries | Done. `jedi guix show|inputs|derivation|plan|references|referrers|size|graph|lint|search|classify` answer as JSON from `cli/query.scm`; `--cave` runs under the cave's pinned channels. Step 2 of `VISION.md`. |
 
 ### Architecture
@@ -69,10 +69,14 @@ holocronix/
    env vars, so this calls `build-docker-image` from `(guix docker)`
    directly. Handle entrypoint, `/etc/passwd`, config baking.
 
-3. **Package agent tooling for Guix** — Claude Code, opencode,
-   kimi-code, qwen-code, and the skills repos have no Guix packages.
-   Fetch release tarballs and wrap them with node, as llm-agents.nix
-   does, in a channel inside this repo.
+3. **Package agent tooling for Guix** — done for Claude Code:
+   `(holocronix agents)` wraps the vendor's prebuilt binary, the same
+   release file llm-agents.nix uses, and `(holocronix claude)` pins the
+   four skills and plugin repositories by commit and hash and builds the
+   plugin seed and settings from `config/defaults.json`. Not yet:
+   opencode (a Bun binary too, plus libstdc++ for a native addon),
+   kimi-code and qwen-code (built from source with pnpm/npm dependency
+   trees) and ori. See `guix/README.md`, sub-problem 6.
 
 4. **CLI backend selection** — done. `jedi init --backend guix <name>`
    scaffolds `cave.scm` and `channels.scm` (default remains `nix`,
@@ -89,22 +93,29 @@ holocronix/
 
 ### Known challenges
 
-- **Package coverage** — nixpkgs is larger. Agent tooling must be
-  packaged for Guix. oh-my-zsh is missing; the Guix image gets its
-  prompt from starship instead. systemd
+- **Package coverage** — nixpkgs is larger. The remaining agents must
+  be packaged for Guix; the ones built from npm or pnpm dependency
+  trees need those trees vendored first. oh-my-zsh is missing; the
+  Guix image gets its prompt from starship instead. systemd
   headers do not exist on Guix; projects needing libudev or sd-bus
   get eudev, elogind, or basu.
+
+- **Prebuilt binaries** — agents ship as Bun executables that ask for
+  the FHS loader path and do not survive patchelf. The image provides
+  that path as a symlink to Guix's glibc instead; a binary that also
+  needs libstdc++ or other non-glibc libraries (opencode) will need an
+  `/etc/ld.so.cache` or equivalent on top.
 
 - **Project integration** — projects need to expose a Guix manifest
   or channel instead of a `flake.nix` with `devShells`. This is a
   user-facing requirement, not a holocronix limitation.
 
-- **Source hashes** — Guix origins require a hash, so skills and
-  plugin repos need a lock of commit plus hash, unlike unlocked
-  flake inputs.
-
 Resolved:
 
+- Source hashes: skills and plugin repositories are pinned by commit
+  plus hash in `(holocronix claude)`, the way Guix origins require;
+  `guix download --git` prints the hash for a new commit and leaves
+  the checkout in the store for the build.
 - Layered images: `build-docker-image` supports `--max-layers`, so
   incremental rebuilds are comparable to `buildLayeredImage`.
 - Root-owned image contents and missing `User`/`WorkingDir`: handled by

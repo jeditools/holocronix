@@ -5,8 +5,9 @@ Nix. This directory is a Guix load path: use it with `guix -L guix ...` from
 the repository root.
 
 Status: experimental but usable. `jedi init --backend guix` scaffolds a Guix
-cave and `jedi build` builds it; see "Sub-problem 4" below. The one thing
-missing for parity is the agents, which have no Guix packages yet.
+cave and `jedi build` builds it; see "Sub-problem 4" below. A Guix cave
+ships Claude Code with its settings and plugin seed by default (sub-problem
+6); the other agents `flake.nix` ships are not packaged for Guix yet.
 
 ## Sub-problem 1: baked Rust dependencies
 
@@ -245,9 +246,10 @@ tarball, so a cave definition is a file returning it:
 
 `examples/hello-rust/cave.scm` is exactly that. Options mirror `mkJediCave`:
 `#:packages` (defaults to `%jedicave-base-specs`, the Nix tool list under
-Guix names), `#:extra-packages`, `#:infra-packages`, `#:env`, `#:symlinks`,
-`#:user`/`#:uid`/`#:gid`, `#:git-user`/`#:git-email`, `#:claude?` and
-`#:claude-settings`, `#:project-setup`, `#:extra-directives`, `#:max-layers`.
+Guix names), `#:extra-packages`, `#:agents`, `#:marketplaces`, `#:plugins`,
+`#:infra-packages`, `#:env`, `#:symlinks`, `#:user`/`#:uid`/`#:gid`,
+`#:git-user`/`#:git-email`, `#:claude?` and `#:claude-settings`,
+`#:project-setup`, `#:extra-directives`, `#:max-layers`.
 
 Why `guix pack` is not enough: its docker format only writes `Env` and
 `Entrypoint` into the image config, and it archives every file as root, so
@@ -262,8 +264,8 @@ still split with `--max-layers`, so images share layers like
 The entrypoint is a port of the Nix `jedicave-start` script: first-boot
 setup, proxy CA injection, cloning bare repos from `/repos` into
 `/workspace` with every seeded branch materialized, project setup, then
-`sleep infinity`. Claude Code seeding is present but off until the agent is
-packaged.
+`sleep infinity`. When the image has Claude Code, first boot also copies
+`settings.json` into `CLAUDE_CONFIG_DIR` (sub-problem 6).
 
 ### Try it
 
@@ -426,8 +428,8 @@ own signing chain is broken on main.
   save a few percent is wasted; `jedi build` also passes
   `--max-silent-time=0`, since compressing a multi-GB archive is silent for
   long enough to trip the daemon's default one-hour limit.
-- A Guix cave has no agents in it yet. Until they are packaged, use it as a
-  reproducible build sandbox and run agents in a Nix cave.
+- A Guix cave ships Claude Code by default; `#:agents '()` in `cave.scm`
+  makes a plain build sandbox. Sub-problem 6 has the details.
 
 ### Known limits
 
@@ -443,11 +445,10 @@ own signing chain is broken on main.
 - **No oh-my-zsh.** Guix has no package for it; `.zshrc` skips it when
   absent, and the prompt comes from starship instead, configured by
   `config/starship.toml` with plain Unicode symbols so it renders without a
-  Nerd Font. The Claude plugin seed directory and settings are not baked yet
-  either, pending agent packaging.
-- **No agents.** The Guix image ships the base tools and the project
-  toolchain, but claude-code and the others are not packaged for Guix yet,
-  so a Guix cave cannot run an agent.
+  Nerd Font.
+- **Only Claude Code.** Of the agents `flake.nix` ships, only claude-code
+  is packaged for Guix; opencode, kimi-code, qwen-code and ori are not.
+  Sub-problem 6 says what each one needs.
 
 ## Sub-problem 5: asking the model
 
@@ -508,3 +509,117 @@ Directly, without `jedi`:
 ```sh
 guix repl -L guix -- cli/query.scm show hello
 ```
+
+## Sub-problem 6: agents
+
+Goal: a Guix cave that runs Claude Code with the settings and pre-installed
+plugins a Nix cave has. Done for Claude Code; the other agents in
+`flake.nix` are covered at the end.
+
+`holocronix/agents.scm` defines the `claude-code` package and
+`%jedicave-default-agents`, which `jedicave-image` installs unless
+`#:agents` says otherwise. `holocronix/claude.scm` pins the four skills and
+plugin repositories `flake.nix` takes as inputs, by commit and hash, and
+builds the plugin seed directory and `settings.json` from
+`config/defaults.json`, the file the Nix builder reads. A cave that wants
+more plugins passes `#:plugins '("name@marketplace")`; one that wants
+another marketplace adds a `(marketplace ...)` record to `#:marketplaces`.
+
+### The binary
+
+Anthropic ships Claude Code as a single executable built with Bun, and
+that is what llm-agents.nix packages, so the Guix package fetches the same
+release file (2.1.231, the pin in `flake.nix`) and leaves it unmodified.
+The usual prebuilt-binary treatment does not apply: `patchelf
+--set-interpreter` relocates the program headers, and the Bun executable
+segfaults on start afterwards. llm-agents.nix uses its own `wrap-buddy`
+tool instead of patchelf for the same reason.
+
+The binary asks for `/lib64/ld-linux-x86-64.so.2`, the FHS loader path.
+Guix's glibc loader searches glibc's own `lib/` by default, so one symlink
+from that path to Guix's `ld-linux-x86-64.so.2` is all the binary needs:
+libc, libm, libpthread, libdl and librt resolve with no RPATH and no
+`LD_LIBRARY_PATH`. `jedicave-image` adds the symlink whenever the image has
+agents, and glibc joins the image closure through it. The process then runs
+as upstream built it, with a real `/proc/self/exe`.
+
+The wrapper at `bin/claude` sets the knobs the Nix wrapper sets:
+`DISABLE_AUTOUPDATER`, `DISABLE_INSTALLATION_CHECKS`, and
+`DISABLE_NON_ESSENTIAL_MODEL_CALLS` as a default rather than forced; plus
+`USE_BUILTIN_RIPGREP=0` with Guix's ripgrep first on `PATH`, since the
+embedded `rg` has the same loader problem. It leaves out the Nix wrapper's
+bubblewrap and socat: in a jedicave those are root-only infrastructure
+tools. Where `/lib64` is absent, in `guix shell` or the build container,
+the wrapper runs the Guix loader explicitly. The build's `check-version`
+phase goes through that path to run `claude --version`, which is what
+catches a glibc mismatch or a damaged download at build time.
+
+### Settings and seed
+
+`CLAUDE_CODE_PLUGIN_SEED_DIR` is the documented way to give a
+network-locked container its plugins: a read-only directory holding
+`known_marketplaces.json`, `marketplaces/<name>/` checkouts, and
+`cache/<marketplace>/<plugin>/<version>/` copies, which Claude Code reads
+by layout. `<name>` must be the `name` inside the checkout's
+`.claude-plugin/marketplace.json`, not the repository name. The seed is
+built once as a store item and linked at `/env/.claude-plugin-seed`.
+`settings.json` is baked at `/env/.claude/settings.json` and copied there
+again by the entrypoint on first boot, because `/env/.claude` is usually a
+volume that hides the baked copy. Both carry the same content as the Nix
+cave's.
+
+`claude plugin list` and `claude plugin marketplace list` report nothing
+in either kind of cave: the seed is read by the plugin loader when a
+session starts, not by those subcommands. Checked against a Nix cave image
+on the same host.
+
+### Pinning
+
+The marketplace pins are commit plus nar hash, the Guix half of
+`flake.lock`. To move one, edit `commit` and `hash` together;
+`guix download --git --commit=COMMIT https://github.com/OWNER/REPO` prints
+the hash and, because the origin is named the way `guix download` names its
+result, leaves the checkout in the store for the build to use. The Claude
+Code hash is the release file's; `guix download URL` prints it.
+
+The hashes committed here were computed from the trees and the file Nix
+had already fetched and verified for the same commits and version, so the
+first Guix build downloaded nothing from GitHub or from Anthropic's bucket.
+
+### Try it
+
+```sh
+guix build -L guix -e '(@ (holocronix agents) claude-code)'
+$(guix build -L guix -e '(@ (holocronix agents) claude-code)')/bin/claude --version
+guix build -L guix -e '(begin (use-modules (holocronix claude)) (claude-plugin-seed))'
+```
+
+A cave gets all of it by default:
+
+```sh
+jedi update my-cave
+jedi build my-cave
+jedi up my-cave
+jedi enter my-cave
+claude --version                     # 2.1.231 (Claude Code)
+ls -la /lib64 /env/.claude-plugin-seed
+```
+
+A test image with the base tools trimmed to nine packages plus Claude Code
+came to a 470 MB tarball and 1.3 GB loaded; Claude Code is 311 MB of that.
+
+### The other agents
+
+`flake.nix` also ships kimi-code, opencode, ori and qwen-code. None is
+packaged yet:
+
+- **opencode** is a Bun executable too, from GitHub releases, so the loader
+  treatment above applies, but it also `dlopen`s a native addon that needs
+  `libstdc++.so.6`, which the glibc-only search path does not find. The
+  image needs an `/etc/ld.so.cache` covering `gcc:lib`, or an equivalent,
+  first.
+- **kimi-code** and **qwen-code** are built from source with pnpm and npm
+  dependency trees and native addons (node-pty, keytar). Packaging them
+  means vendoring those trees the way `cargo-vendor` does for crates.
+- **ori** is a native binary built from source in llm-agents.nix; not
+  looked at yet.
