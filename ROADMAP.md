@@ -127,14 +127,73 @@ credential proxy and on Docker inside the guest; we win on reproducible
 images, baked toolchains, egress control over coop, and the git handoff.
 The designs compose.
 
+### Target design
+
+The most secure design is assembled from parts; none of the reviewed
+tools ships it. Layer by layer:
+
+- **Image identity: ours.** A Nix or Guix derivation built in a sandbox
+  from pinned inputs. Nothing reviewed matches it.
+- **Boundary: a hardware VM.** Firecracker is the strongest VMM: small,
+  built for hostile multi-tenant workloads, with a jailer and seccomp.
+  QEMU under Gondolin is a larger surface even with its trimmed device
+  set. gVisor and Kata sit below both.
+- **Network: no route out of the guest.** Every flow terminates in a
+  host-side policy point that speaks HTTP and TLS and nothing else.
+  Gondolin has this by construction. It is the biggest gap in our
+  design and in coop's.
+- **Secrets: never in the guest.** Placeholders substituted per host, an
+  operation allowlist so a key can only do what the agent needs, and a
+  jailed proxy that fails closed. Gondolin's substitution plus coop's
+  jail and allowlist.
+- **Workspace: the bare-repo handoff.** Seed from a bare repo, work on
+  the guest disk, harvest as a bundle. Every reviewed tool exposes the
+  host `.git` in some way; ours never does.
+- **Guest hardening stays** under a VM: unprivileged user, seccomp,
+  read-only root. It costs nothing, and a wrong boundary then degrades
+  gracefully.
+- **Host privileges: one-time privileged setup, then a user process.**
+  Gondolin runs as a user with `/dev/kvm`. A Firecracker backend needs
+  a pre-created TAP, not `sudo` on every run as coop does.
+
+### Order of work
+
+The order matters more than the runtime. The attack that happens in
+practice is prompt injection followed by exfiltration through open
+egress or an allowed domain, and a VM boundary does nothing against it.
+coop is the proof: hardware isolation, open egress.
+
+1. **Close egress inside Docker, now.** The strongest form is cheap:
+   give the cave a compose network marked `internal: true`, so it has no
+   default route, and attach only the proxy and DNS sidecars to the
+   outside. The cave can then reach nothing except mitmproxy, no
+   iptables runs inside it, and `NET_ADMIN` and `NET_RAW` come off the
+   container. Add proxy-mode secrets by default, the operation
+   allowlist, synthetic DNS by default, and cgroup limits. All of it is
+   policy and carries over unchanged to any runtime. Details under
+   "Policy hardening" below and "Default-deny egress" in `SECURITY.md`.
+2. **Then the boundary, Gondolin first.** It takes the image as is,
+   needs no root, and its network model is already the right one. If
+   the FUSE workspace or the HTTP-only stack breaks the cave workflow,
+   move to Firecracker, where the step 1 policy moves to the host
+   `FORWARD` chain.
+3. **Firecracker as the end state** if the strongest VMM or Docker
+   inside the guest is wanted. It is the most work: an ext4 rootfs and
+   kernel from the closure, host networking, and our own proxy tunnel.
+
+Not to do: adopt a VM before fixing egress; adopt `vmpi` or `coop` as
+tools; leave the egress policy inside the guest under any runtime. It
+belongs on the other side of the boundary.
+
 ### Status
 
 | Item | State |
 |------|-------|
+| Internal cave network, proxy-only egress, no `NET_ADMIN` | Planned, first. See "Order of work". |
 | gVisor or Kata via `runtime:` in `compose.yml` | Not started. Drop-in for the compose layer. |
 | Gondolin as a microVM backend | Evaluated. Spike planned, see below. |
 | Firecracker as a microVM backend | Evaluated through coop. Second candidate, see "Gondolin or Firecracker". |
-| Default-deny egress in `policy.yaml` | Planned. See `SECURITY.md`, "Default-deny egress". |
+| Default-deny egress in `policy.yaml` | Planned, for caves that run without the proxy. See `SECURITY.md`, "Default-deny egress". |
 | Model API operation allowlist in the proxy | Planned. See `SECURITY.md`, "Model API operation allowlist". |
 | Secrets default to proxy mode | Planned. |
 | cgroup limits in `compose.yml` | Planned. See `SECURITY.md`, "Resource limits". |
@@ -197,6 +256,9 @@ comparisons surfaced, without changing runtimes. Details under
 "Default-deny egress" and "Model API operation allowlist" in
 `SECURITY.md`:
 
+- put the cave on an `internal: true` network with the proxy and DNS
+  sidecars as its only neighbours, and drop `NET_ADMIN` and `NET_RAW`;
+  the iptables items below remain for caves that run without the proxy;
 - accept only the proxy IP and DNS when the proxy is on, instead of
   every port on every allowlisted IP;
 - match allowlist rules on port, not just destination IP;

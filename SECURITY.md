@@ -31,7 +31,7 @@ This document describes what the jedicave isolates, what it does not, and where 
 | Read-only root filesystem | Prevents persistent container modifications |
 | Cloud metadata blocking | Prevents IAM credential leaks on cloud hosts |
 | User namespace remapping | Maps container root to unprivileged host UID |
-| Default-deny egress | Drops non-proxy ports on allowlisted IPs, blocks private ranges |
+| Default-deny egress | Internal network with proxy-only egress and no `NET_ADMIN`; port-matched allowlist otherwise |
 | Model API operation allowlist | Proxy refuses API operations the agent does not need |
 | gVisor, Kata Containers, or a microVM runtime | Separate kernel from the host; Docker for the agent; see [RELATED-WORK.md](RELATED-WORK.md) |
 | Volume integrity checks | Detects tampering between sessions |
@@ -103,6 +103,8 @@ No CPU, memory, or disk limits are configured by default. A runaway or malicious
 ### NET_ADMIN capability
 
 The container is granted `NET_ADMIN` and `NET_RAW` capabilities to support iptables-based firewall rules. These capabilities also allow the container's root user (accessible via `docker compose exec --user root`) to manipulate network interfaces, routing tables, and raw sockets. The unprivileged container user cannot exercise these capabilities directly, but they expand the attack surface if a privilege escalation vulnerability exists.
+
+Both capabilities exist only because the egress policy is enforced inside the container. With the internal-network design under "Default-deny egress" below, no iptables runs inside the cave and both can be dropped.
 
 ### Named volumes
 
@@ -197,7 +199,9 @@ Set `network.dns.mode: synthetic` in `policy.yaml` to deploy a CoreDNS sidecar t
 
 ### Default-deny egress
 
-Tighten the generated firewall so an allowlist entry admits only what the policy actually needs:
+The strongest form needs no iptables at all. Put the cave on a compose network marked `internal: true`, which Docker creates with no route to the outside, and attach only the proxy and DNS sidecars to a second, external network. The cave can then reach nothing but those two containers, every byte that leaves is HTTP or TLS the proxy has seen, and `NET_ADMIN` and `NET_RAW` can be dropped from the container because nothing inside it needs to program the firewall. This is the in-Docker equivalent of Gondolin's host-terminated network, and it is the first item in the "Runtime isolation" section of [ROADMAP.md](ROADMAP.md).
+
+For caves that run without the proxy, tighten the generated firewall so an allowlist entry admits only what the policy actually needs:
 
 - When the L7 proxy is enabled, accept only the proxy IP and DNS, and drop everything else. Today allowlisted IPs are still accepted on every port, so only 80 and 443 are actually mediated.
 - Without the proxy, match allowlist rules on `-p tcp --dport 443` (plus 80 or 22 where a domain needs them) instead of accepting all protocols and ports.
