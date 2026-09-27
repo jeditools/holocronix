@@ -441,7 +441,9 @@ own signing chain is broken on main.
 - **Lockfile v1** (checksums under `[metadata]`) is not parsed; v2 through v4
   are.
 - **No oh-my-zsh.** Guix has no package for it; `.zshrc` skips it when
-  absent. The Claude plugin seed directory and settings are not baked yet
+  absent, and the prompt comes from starship instead, configured by
+  `config/starship.toml` with plain Unicode symbols so it renders without a
+  Nerd Font. The Claude plugin seed directory and settings are not baked yet
   either, pending agent packaging.
 - **No agents.** The Guix image ships the base tools and the project
   toolchain, but claude-code and the others are not packaged for Guix yet,

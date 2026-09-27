@@ -39,13 +39,14 @@
 
 (define %jedicave-base-specs
   ;; Same set as jedicavePackages in lib/mkJediCave.nix, under Guix names.
-  ;; Missing on Guix: oh-my-zsh, systemd headers.
+  ;; Missing on Guix: oh-my-zsh, systemd headers.  starship stands in for
+  ;; the oh-my-zsh prompt theme; config/starship.toml configures it.
   '(;; Core
     "coreutils" "diffutils" "findutils" "bash" "zsh" "git" "nss-certs"
     "git-filter-repo" "tar" "gzip"
     ;; CLI tools
     "fd" "ripgrep" "grep" "fzf" "git-delta" "tmux" "ast-grep" "jq" "nano"
-    "unzip" "vim" "curl" "sed" "gawk" "less" "poppler"
+    "unzip" "vim" "curl" "sed" "gawk" "less" "poppler" "starship"
     ;; Build tools
     "gcc-toolchain" "make" "pkg-config"
     ;; Monitoring / diagnostics (read-only, low-risk)
@@ -404,6 +405,10 @@ command compressing the archive; it must produce gzip output."
                 (directory ,(string-append home "/.cache/oh-my-zsh"))
                 (file ,(string-append home "/.zshrc")
                       ,(read-file #$(local-file "../../config/.zshrc" "zshrc")))
+                ;; 'file' does not create parent directories; 'directory' does.
+                (directory ,(string-append home "/.config"))
+                (file ,(string-append home "/.config/starship.toml")
+                      ,(read-file #$(local-file "../../config/starship.toml")))
                 (file ,(string-append home "/.tmux.conf")
                       ,(read-file #$(local-file "../../config/.tmux.conf"
                                                "tmux.conf")))

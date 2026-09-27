@@ -90,7 +90,8 @@ holocronix/
 ### Known challenges
 
 - **Package coverage** — nixpkgs is larger. Agent tooling must be
-  packaged for Guix. oh-my-zsh is missing but trivial. systemd
+  packaged for Guix. oh-my-zsh is missing; the Guix image gets its
+  prompt from starship instead. systemd
   headers do not exist on Guix; projects needing libudev or sd-bus
   get eudev, elogind, or basu.
 

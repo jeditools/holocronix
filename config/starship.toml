@@ -1,0 +1,41 @@
+# Starship prompt for jedicave (https://starship.rs/config/).
+#
+# Symbols are plain Unicode that a stock monospace font renders.  Starship's
+# defaults use Nerd Font glyphs for the git branch, node, package and
+# read-only markers, which show as boxes without a patched font.
+"$schema" = 'https://starship.rs/config-schema.json'
+
+# Default is 500 ms; git status on a large working tree can exceed it and
+# starship then prints a warning above the prompt.
+command_timeout = 1000
+
+[container]
+# Docker leaves /.dockerenv behind, so this shows in every cave.
+format = '[⬢ cave]($style) '
+style = 'bold dimmed red'
+
+[character]
+success_symbol = '[➜](bold green)'
+error_symbol = '[➜](bold red)'
+
+[directory]
+truncation_length = 4
+read_only = ' ro'
+
+[git_branch]
+symbol = '⎇ '
+
+[package]
+symbol = 'pkg '
+
+[rust]
+symbol = 'rs '
+
+[python]
+symbol = 'py '
+
+[nodejs]
+symbol = 'node '
+
+[golang]
+symbol = 'go '

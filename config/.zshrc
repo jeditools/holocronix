@@ -7,8 +7,12 @@ export PATH="$HOME/.local/bin:$PATH"
 # Oh My Zsh ($ZSH env var is set by the container environment)
 ZSH_THEME="robbyrussell"
 plugins=(git)
-# oh-my-zsh is present in the Nix image; the Guix image has no package for it yet.
+# oh-my-zsh is present in the Nix image; Guix has no package for it.
 [ -n "$ZSH" ] && [ -f "$ZSH/oh-my-zsh.sh" ] && source "$ZSH/oh-my-zsh.sh"
+
+# Prompt: starship when the image ships it (the Guix image does), configured
+# by ~/.config/starship.toml.  It takes over from the oh-my-zsh theme.
+command -v starship >/dev/null 2>&1 && eval "$(starship init zsh)"
 
 # History settings
 export HISTFILE=/commandhistory/.zsh_history
