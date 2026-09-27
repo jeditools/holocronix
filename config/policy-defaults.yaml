@@ -1,14 +1,23 @@
 # jedicave policy — per-cave security configuration
 #
-# This file declares the network, secret, proxy, and hook policy for a
-# single cave. `jedi up` reads it at start time.
+# This file declares the network, secret, proxy, hook, and resource policy
+# for a single cave. `jedi up` reads it at start time. The copy `jedi init`
+# writes is POLICY_DEFAULTS in cli/jedi.py; keep the two in step.
 
 network:
   # Enable the iptables egress allowlist (default: true).
   firewall: true
 
-  # Domains allowed through the firewall.
-  # Each entry becomes an `iptables -A OUTPUT -d <domain> -j ACCEPT` rule.
+  # Egress mode:
+  #   allowlist — iptables inside the cave admits the domains below (default)
+  #   proxy     — the cave sits on an internal network with no route out;
+  #               the proxy and DNS sidecars are its only neighbours, and
+  #               nothing inside the cave needs NET_ADMIN.  Requires
+  #               proxy.enabled: true and dns.mode: synthetic.
+  egress: allowlist
+
+  # Domains allowed through the firewall (or, with egress: proxy, through
+  # the proxy).
   domains:
     - api.anthropic.com
     # - github.com
@@ -18,23 +27,26 @@ network:
     # - files.pythonhosted.org
 
   # DNS mode:
-  #   open       — no DNS filtering (current default, allows DNS tunneling)
+  #   synthetic  — CoreDNS sidecar; only allowlisted domains resolve (default)
   #   trusted    — redirect DNS to specified resolvers via iptables DNAT
-  #   synthetic  — CoreDNS sidecar; only allowlisted domains resolve (NXDOMAIN otherwise)
+  #   open       — no DNS filtering (allows DNS tunneling)
   dns:
-    mode: open
+    mode: synthetic
     # servers: [1.1.1.1, 1.0.0.1]  # required for trusted mode
+    # upstream: [8.8.8.8, 8.8.4.4]  # resolvers CoreDNS forwards to
 
 # Secrets are resolved on the host (trusted) and injected into the cave.
 # Each `value_cmd` runs on the host at `jedi up` time.
 #
 # inject modes:
-#   env    — passed as env var into the shell container (Phase 1B)
-#   proxy  — replaced by the L7 proxy only for matching domains (Phase 3)
+#   env    — passed as env var into the shell container
+#   proxy  — the cave sees a placeholder; the L7 proxy substitutes the real
+#            value in requests to `domains` (requires proxy.enabled)
+# When `inject` is unset, secrets use proxy mode if the proxy is enabled
+# and env mode otherwise.
 secrets: {}
   # ANTHROPIC_API_KEY:
   #   value_cmd: "cat ~/.config/anthropic/api_key"
-  #   inject: env
   #   domains: [api.anthropic.com]
   #
   # GITHUB_TOKEN:
@@ -42,12 +54,21 @@ secrets: {}
   #   inject: proxy
   #   placeholder: "{{GITHUB_TOKEN}}"
   #   domains: [api.github.com]
-  #   headers: [Authorization]
+  #   headers: [Authorization]   # default: any header carrying the placeholder
 
 # L7 egress proxy (mitmproxy sidecar). Enables HTTP-level allow/deny,
 # proxy-based secret injection, and request/response hooks.
 proxy:
   enabled: false
+
+  # Operation allowlist per host. A listed host admits only these
+  # "METHOD /path" pairs and answers 403 to everything else, so a key can
+  # do only what the agent needs. A path ending in * matches by prefix.
+  # Unlisted hosts are unrestricted (the domain allowlist still applies).
+  operations: {}
+    # api.anthropic.com:
+    #   - POST /v1/messages
+    #   - POST /v1/messages/count_tokens
 
 # Request/response hooks run in the proxy container. Builtin types:
 #   log   — JSONL audit trail of all requests/responses
@@ -58,3 +79,10 @@ hooks: []
   #   type: log
   #   config:
   #     path: ./logs/audit.jsonl
+
+# cgroup limits for the shell container. pids stops fork bombs (0 turns
+# it off); set cpus and memory to what the project's builds need.
+resources:
+  pids: 4096
+  # cpus: 4
+  # memory: 8G

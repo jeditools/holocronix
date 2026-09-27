@@ -167,15 +167,15 @@ practice is prompt injection followed by exfiltration through open
 egress or an allowed domain, and a VM boundary does nothing against it.
 coop is the proof: hardware isolation, open egress.
 
-1. **Close egress inside Docker, now.** The strongest form is cheap:
-   give the cave a compose network marked `internal: true`, so it has no
-   default route, and attach only the proxy and DNS sidecars to the
-   outside. The cave can then reach nothing except mitmproxy, no
-   iptables runs inside it, and `NET_ADMIN` and `NET_RAW` come off the
-   container. Add proxy-mode secrets by default, the operation
-   allowlist, synthetic DNS by default, and cgroup limits. All of it is
-   policy and carries over unchanged to any runtime. Details under
-   "Policy hardening" below and "Default-deny egress" in `SECURITY.md`.
+1. **Close egress inside Docker first.** Done: `network.egress: proxy`
+   gives the cave a compose network marked `internal: true`, so it has
+   no default route, and attaches only the proxy and DNS sidecars to the
+   outside. The cave can reach nothing except mitmproxy, no iptables runs
+   inside it, and `NET_ADMIN` and `NET_RAW` are off the container. With
+   it came proxy-mode secrets by default, the operation allowlist,
+   synthetic DNS by default, and a PID limit. All of it is policy and
+   carries over unchanged to any runtime. What remains is listed under
+   "Policy hardening" below.
 2. **Then the boundary, Gondolin first.** It takes the image as is,
    needs no root, and its network model is already the right one. If
    the FUSE workspace or the HTTP-only stack breaks the cave workflow,
@@ -193,14 +193,15 @@ belongs on the other side of the boundary.
 
 | Item | State |
 |------|-------|
-| Internal cave network, proxy-only egress, no `NET_ADMIN` | Planned, first. See "Order of work". |
+| Internal cave network, proxy-only egress, no `NET_ADMIN` | Done. `network.egress: proxy` in `policy.yaml`; each project gets its own /28 for the sidecars. |
 | gVisor or Kata via `runtime:` in `compose.yml` | Not started. Drop-in for the compose layer. |
 | Gondolin as a microVM backend | Evaluated. Spike planned, see below. |
 | Firecracker as a microVM backend | Evaluated through coop. Second candidate, see "Gondolin or Firecracker". |
-| Default-deny egress in `policy.yaml` | Planned, for caves that run without the proxy. See `SECURITY.md`, "Default-deny egress". |
-| Model API operation allowlist in the proxy | Planned. See `SECURITY.md`, "Model API operation allowlist". |
-| Secrets default to proxy mode | Planned. |
-| cgroup limits in `compose.yml` | Planned. See `SECURITY.md`, "Resource limits". |
+| Default-deny egress in allowlist mode | Planned. See `SECURITY.md`, "Default-deny egress in allowlist mode". |
+| Model API operation allowlist in the proxy | Done. `proxy.operations` in `policy.yaml`. |
+| Secrets default to proxy mode | Done. An unset `inject` means proxy when the proxy is on. |
+| Synthetic DNS by default | Done, for new caves. |
+| cgroup limits in `compose.yml` | Partly. `resources.pids` capped by default; `cpus` and `memory` per cave. |
 
 ### Gondolin spike
 
@@ -256,18 +257,24 @@ coop's `network.rs` as the reference for the host side.
 ### Policy hardening borrowed from Gondolin and coop
 
 Cheap changes to the generated firewall and policy that close gaps the
-comparisons surfaced, without changing runtimes. Details under
-"Default-deny egress" and "Model API operation allowlist" in
-`SECURITY.md`:
+comparisons surfaced, without changing runtimes.
 
-- put the cave on an `internal: true` network with the proxy and DNS
-  sidecars as its only neighbours, and drop `NET_ADMIN` and `NET_RAW`;
-  the iptables items below remain for caves that run without the proxy;
+Done, in `policy.yaml`:
+
+- `network.egress: proxy` puts the cave on an `internal: true` network
+  with the proxy and DNS sidecars as its only neighbours, and drops
+  `NET_ADMIN` and `NET_RAW`;
+- `dns.mode` defaults to `synthetic`;
+- secrets default to `inject: proxy` when the proxy is on;
+- `proxy.operations` allows only the model API operations the agent uses
+  and returns 403 for everything else on those hosts;
+- `resources.pids` caps the process count; `cpus` and `memory` are per
+  cave.
+
+Remaining, for caves that stay in allowlist mode (details under
+"Default-deny egress in allowlist mode" in `SECURITY.md`):
+
 - accept only the proxy IP and DNS when the proxy is on, instead of
   every port on every allowlisted IP;
 - match allowlist rules on port, not just destination IP;
-- block private and link-local ranges plus the cloud metadata address;
-- default `dns.mode` to `synthetic`;
-- default secrets to `inject: proxy`;
-- with the proxy on, allow only the model API operations the agent uses
-  and return 403 for everything else on those hosts.
+- block private and link-local ranges plus the cloud metadata address.

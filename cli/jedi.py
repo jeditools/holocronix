@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """jedi — CLI for managing jedicaves (sandboxed containers)."""
 
+import hashlib
+import ipaddress
 import json
 import os
 import shutil
@@ -642,6 +644,83 @@ def _policy_domains(policy: dict) -> list[str]:
     return domains
 
 
+def _dns_mode(policy: dict) -> str:
+    """network.dns.mode; synthetic unless the policy says otherwise."""
+    return ((policy.get("network") or {}).get("dns") or {}).get("mode") or "synthetic"
+
+
+def _proxy_enabled(policy: dict) -> bool:
+    return bool((policy.get("proxy") or {}).get("enabled", False))
+
+
+def _egress_mode(policy: dict) -> str:
+    """network.egress: 'allowlist' (iptables inside the cave admits the
+    domains) or 'proxy' (internal network; the proxy is the only way out)."""
+    return (policy.get("network") or {}).get("egress") or "allowlist"
+
+
+def _inject_mode(cfg: dict | None, policy: dict) -> str:
+    """A secret's inject mode. Unset means proxy when the proxy is on and
+    env otherwise, so enabling the proxy is the one opt-in."""
+    mode = (cfg or {}).get("inject")
+    if mode:
+        return mode
+    return "proxy" if _proxy_enabled(policy) else "env"
+
+
+def _parse_operations(policy: dict) -> dict[str, list[tuple[str, str]]]:
+    """proxy.operations as {host: [(METHOD, /path), ...]}.
+
+    A path ending in '*' matches by prefix; METHOD '*' matches any method.
+    """
+    ops = (policy.get("proxy") or {}).get("operations") or {}
+    parsed = {}
+    for host, entries in ops.items():
+        rules = []
+        for entry in entries or []:
+            parts = str(entry).split(None, 1)
+            if len(parts) != 2 or not parts[1].startswith("/"):
+                err_console.print(
+                    f"[red]proxy.operations[{host}]: '{entry}' is not 'METHOD /path'[/]")
+                raise typer.Exit(1)
+            rules.append((parts[0].upper(), parts[1]))
+        parsed[host] = rules
+    return parsed
+
+
+def _validate_policy(policy: dict) -> None:
+    """Refuse policy combinations that would start a cave weaker than it
+    reads. Called before anything is written or started."""
+    egress = _egress_mode(policy)
+    if egress not in ("allowlist", "proxy"):
+        err_console.print(f"[red]network.egress must be 'allowlist' or 'proxy', not '{egress}'[/]")
+        raise typer.Exit(1)
+    dns_mode = _dns_mode(policy)
+    if dns_mode not in ("open", "trusted", "synthetic"):
+        err_console.print(f"[red]network.dns.mode must be open, trusted, or synthetic, not '{dns_mode}'[/]")
+        raise typer.Exit(1)
+    if egress == "proxy":
+        if not _proxy_enabled(policy):
+            err_console.print("[red]network.egress: proxy requires proxy.enabled: true[/]")
+            raise typer.Exit(1)
+        if dns_mode != "synthetic":
+            err_console.print("[red]network.egress: proxy requires network.dns.mode: synthetic[/]")
+            raise typer.Exit(1)
+    for name, cfg in (policy.get("secrets") or {}).items():
+        mode = _inject_mode(cfg, policy)
+        if mode not in ("env", "proxy"):
+            err_console.print(f"[red]Secret '{name}': inject must be env or proxy, not '{mode}'[/]")
+            raise typer.Exit(1)
+        if mode == "proxy":
+            if not _proxy_enabled(policy):
+                err_console.print(f"[red]Secret '{name}': inject: proxy requires proxy.enabled: true[/]")
+                raise typer.Exit(1)
+            if not (cfg or {}).get("domains"):
+                err_console.print(f"[red]Secret '{name}': proxy mode needs domains to inject into[/]")
+                raise typer.Exit(1)
+    _parse_operations(policy)
+
+
 def _resolve_secrets(d: Path, policy: dict) -> Path | None:
     """Resolve each secret's value_cmd on the host and write secrets.env.
 
@@ -658,7 +737,7 @@ def _resolve_secrets(d: Path, policy: dict) -> Path | None:
 
     lines = []
     for name, cfg in secrets.items():
-        inject = (cfg or {}).get("inject", "env")
+        inject = _inject_mode(cfg, policy)
         cmd = (cfg or {}).get("value_cmd")
         placeholder = (cfg or {}).get("placeholder", "{{" + name + "}}")
 
@@ -691,12 +770,14 @@ def _clear_secrets(d: Path) -> None:
 
 
 def firewall_commands(d: Path) -> str:
+    """iptables rules for a cave in allowlist egress mode, as one shell
+    line run as root inside the shell container."""
     policy = _load_policy(d)
     domains = _policy_domains(policy)
     network = policy.get("network") or {}
     dns_cfg = network.get("dns") or {}
-    dns_mode = dns_cfg.get("mode", "open")
-    proxy_enabled = bool((policy.get("proxy") or {}).get("enabled", False))
+    dns_mode = _dns_mode(policy)
+    proxy_enabled = _proxy_enabled(policy)
 
     ipt = "/usr/local/sbin/iptables"
     cmds = [
@@ -720,8 +801,12 @@ def firewall_commands(d: Path) -> str:
     if proxy_enabled:
         # L7 proxy enforcement: allow traffic to the proxy, drop direct 80/443.
         # Agent sets HTTP_PROXY/HTTPS_PROXY env vars; iptables ensures bypass
-        # is impossible even if the agent unsets them.
-        cmds.append(f"{ipt} -A OUTPUT -d {CAVE_NET_PROXY_IP} -j ACCEPT")
+        # is impossible even if the agent unsets them. The proxy's address
+        # is resolved in place from the compose service name, so these
+        # rules do not depend on which subnet the project was given.
+        cmds.append('PROXY_IP=$(getent hosts proxy | awk \'NR==1{print $1}\')')
+        cmds.append('[ -n "$PROXY_IP" ]')
+        cmds.append(f'{ipt} -A OUTPUT -d "$PROXY_IP" -j ACCEPT')
         cmds.append(f"{ipt} -A OUTPUT -p tcp --dport 80 -j DROP")
         cmds.append(f"{ipt} -A OUTPUT -p tcp --dport 443 -j DROP")
 
@@ -895,7 +980,16 @@ network:
   # Enable the iptables egress allowlist.
   firewall: true
 
-  # Domains allowed through the firewall.
+  # Egress mode:
+  #   allowlist — iptables inside the cave admits the domains below (default)
+  #   proxy     — the cave sits on an internal network with no route out;
+  #               the proxy and DNS sidecars are its only neighbours, and
+  #               nothing inside the cave needs NET_ADMIN.  Requires
+  #               proxy.enabled: true and dns.mode: synthetic.
+  egress: allowlist
+
+  # Domains allowed through the firewall (or, with egress: proxy, through
+  # the proxy).
   domains:
     - api.anthropic.com
     # - github.com
@@ -905,23 +999,26 @@ network:
     # - files.pythonhosted.org
 
   # DNS mode:
-  #   open       — no DNS filtering (allows DNS tunneling)
+  #   synthetic  — CoreDNS sidecar; only allowlisted domains resolve (default)
   #   trusted    — redirect DNS to specified resolvers via iptables DNAT
-  #   synthetic  — CoreDNS sidecar; only allowlisted domains resolve
+  #   open       — no DNS filtering (allows DNS tunneling)
   dns:
-    mode: open
+    mode: synthetic
     # servers: [1.1.1.1, 1.0.0.1]  # required for trusted mode
+    # upstream: [8.8.8.8, 8.8.4.4]  # resolvers CoreDNS forwards to
 
 # Secrets resolved on the host and injected into the cave.
 # `value_cmd` runs on the host at `jedi up` time.
 #
 # inject modes:
 #   env    — passed as env var into the shell container
-#   proxy  — replaced by the L7 proxy only for matching domains (requires proxy.enabled)
+#   proxy  — the cave sees a placeholder; the L7 proxy substitutes the real
+#            value in requests to `domains` (requires proxy.enabled)
+# When `inject` is unset, secrets use proxy mode if the proxy is enabled
+# and env mode otherwise.
 secrets: {}
   # ANTHROPIC_API_KEY:
   #   value_cmd: "cat ~/.config/anthropic/api_key"
-  #   inject: env
   #   domains: [api.anthropic.com]
   #
   # GITHUB_TOKEN:
@@ -929,12 +1026,21 @@ secrets: {}
   #   inject: proxy
   #   placeholder: "{{GITHUB_TOKEN}}"
   #   domains: [api.github.com]
-  #   headers: [Authorization]
+  #   headers: [Authorization]   # default: any header carrying the placeholder
 
 # L7 egress proxy (mitmproxy sidecar). Enables HTTP-level allow/deny,
 # proxy-based secret injection, and request/response hooks.
 proxy:
   enabled: false
+
+  # Operation allowlist per host. A listed host admits only these
+  # "METHOD /path" pairs and answers 403 to everything else, so a key can
+  # do only what the agent needs. A path ending in * matches by prefix.
+  # Unlisted hosts are unrestricted (the domain allowlist still applies).
+  operations: {}
+    # api.anthropic.com:
+    #   - POST /v1/messages
+    #   - POST /v1/messages/count_tokens
 
 # Request/response hooks run in the proxy container.
 hooks: []
@@ -943,25 +1049,140 @@ hooks: []
   #   type: log
   #   config:
   #     path: ./logs/audit.jsonl
+
+# cgroup limits for the shell container. pids stops fork bombs (0 turns
+# it off); set cpus and memory to what the project's builds need.
+resources:
+  pids: 4096
+  # cpus: 4
+  # memory: 8G
 """
 
-# Static IPs inside the per-cave bridge network. Stable so iptables and
-# DNS settings can refer to them without a name-resolution step.
-CAVE_NET_SUBNET = "172.30.0.0/24"
-CAVE_NET_DNS_IP = "172.30.0.2"
-CAVE_NET_PROXY_IP = "172.30.0.3"
+# Sidecar network. Each compose project (a cave, or a cave session) gets
+# its own /28 carved from this pool, chosen by hashing the project name so
+# it is stable across restarts, and moved to the next free slot when
+# another Docker network already covers it. Sidecars get fixed addresses
+# inside the /28 so `dns:` can name the CoreDNS sidecar before anything
+# runs.
+CAVE_NET_POOL = ipaddress.ip_network("172.30.0.0/16")
+CAVE_NET_PREFIX = 28
+CAVE_NET_SLOTS = 2 ** (CAVE_NET_PREFIX - CAVE_NET_POOL.prefixlen)
+
+
+def _net_from_subnet(subnet: ipaddress.IPv4Network, slot: int | None = None) -> dict:
+    """Sidecar addresses inside a subnet: .1 is Docker's gateway, then DNS
+    and the proxy."""
+    return {
+        "slot": slot,
+        "subnet": str(subnet),
+        "dns": str(subnet[2]),
+        "proxy": str(subnet[3]),
+    }
+
+
+def _cave_net(project: str, slot: int | None = None) -> dict:
+    """Subnet and sidecar addresses for a compose project."""
+    if slot is None:
+        digest = hashlib.sha256(project.encode()).digest()
+        slot = int.from_bytes(digest[:4], "big") % CAVE_NET_SLOTS
+    base = int(CAVE_NET_POOL.network_address) + slot * (1 << (32 - CAVE_NET_PREFIX))
+    return _net_from_subnet(ipaddress.IPv4Network((base, CAVE_NET_PREFIX)), slot)
+
+
+def _docker_networks() -> list[tuple[str, str, list[ipaddress.IPv4Network]]]:
+    """(name, compose project label, IPv4 subnets) for every Docker network.
+    Empty when the daemon cannot be reached."""
+    ids = subprocess.run(["docker", "network", "ls", "-q"], capture_output=True, text=True)
+    if ids.returncode != 0 or not ids.stdout.split():
+        return []
+    fmt = ('{{.Name}}\t{{index .Labels "com.docker.compose.project"}}\t'
+           '{{range .IPAM.Config}}{{.Subnet}} {{end}}')
+    out = subprocess.run(["docker", "network", "inspect", "-f", fmt] + ids.stdout.split(),
+                         capture_output=True, text=True)
+    nets = []
+    for line in out.stdout.splitlines():
+        name, project, subnets = (line.split("\t") + ["", ""])[:3]
+        parsed = []
+        for s in subnets.split():
+            try:
+                net = ipaddress.ip_network(s, strict=False)
+            except ValueError:
+                continue
+            if net.version == 4:
+                parsed.append(net)
+        nets.append((name, project, parsed))
+    return nets
+
+
+def _pick_cave_net(project: str) -> dict:
+    """The sidecar network for a project: the one it already has if it is
+    up (whatever its shape, so a cave started by an older jedi keeps
+    working), else the hashed slot advanced past every other network's
+    subnet."""
+    nets = _docker_networks()
+    for name, label, subnets in nets:
+        if label == project and name.endswith("_cave-net"):
+            for s in subnets:
+                if s.subnet_of(CAVE_NET_POOL):
+                    return _net_from_subnet(s)
+    taken = [s for _, label, subnets in nets if label != project for s in subnets]
+    net = _cave_net(project)
+    for _ in range(CAVE_NET_SLOTS):
+        subnet = ipaddress.ip_network(net["subnet"])
+        if not any(subnet.overlaps(t) for t in taken):
+            return net
+        net = _cave_net(project, (net["slot"] + 1) % CAVE_NET_SLOTS)
+    err_console.print(f"[red]No free subnet left in {CAVE_NET_POOL} for the cave network[/]")
+    raise typer.Exit(1)
+
+
+def _net_env(env: dict, project: str) -> dict:
+    """Add the sidecar network values that compose.yml interpolates."""
+    net = _pick_cave_net(project)
+    env["JEDI_NET_SUBNET"] = net["subnet"]
+    env["JEDI_NET_DNS"] = net["dns"]
+    env["JEDI_NET_PROXY"] = net["proxy"]
+    return env
+
+
+def _resource_limits(policy: dict) -> list[str]:
+    """compose `deploy.resources.limits` lines for the shell service."""
+    res = policy.get("resources") or {}
+    pids = res.get("pids", 4096)
+    cpus = res.get("cpus")
+    memory = res.get("memory")
+    limits = []
+    if cpus:
+        limits.append(f"          cpus: '{cpus}'")
+    if memory:
+        limits.append(f"          memory: {memory}")
+    if pids:
+        limits.append(f"          pids: {int(pids)}")
+    if not limits:
+        return []
+    return ["    deploy:", "      resources:", "        limits:"] + limits
 
 
 def _generate_compose(name: str, policy: dict) -> str:
     """Render compose.yml content from a cave name + policy dict.
 
-    Conditionally adds a CoreDNS sidecar (synthetic DNS mode) and a
-    bridge network with static IPs. Layout matches the original
-    static template when DNS is `open` and proxy is disabled.
+    Sidecars (CoreDNS for synthetic DNS, mitmproxy for the L7 proxy) share
+    a per-project bridge network with fixed addresses. The values come from
+    the JEDI_NET_* variables `jedi` sets for the compose project; the
+    defaults written into the file are the default session's, so a plain
+    `docker compose` in the cave directory still works.
+
+    With `network.egress: proxy` that network is internal (no route out),
+    the sidecars alone join a second, external network, and the shell
+    container gets no NET_ADMIN or NET_RAW because no iptables runs in it.
     """
-    network = policy.get("network") or {}
-    dns_mode = (network.get("dns") or {}).get("mode", "open")
-    proxy_enabled = bool((policy.get("proxy") or {}).get("enabled", False))
+    dns_mode = _dns_mode(policy)
+    proxy_enabled = _proxy_enabled(policy)
+    internal = _egress_mode(policy) == "proxy"
+    default_net = _cave_net(name)
+    subnet = f"${{JEDI_NET_SUBNET:-{default_net['subnet']}}}"
+    dns_ip = f"${{JEDI_NET_DNS:-{default_net['dns']}}}"
+    proxy_ip = f"${{JEDI_NET_PROXY:-{default_net['proxy']}}}"
 
     needs_net = dns_mode == "synthetic" or proxy_enabled
 
@@ -970,10 +1191,20 @@ def _generate_compose(name: str, policy: dict) -> str:
     # --- shell service ---
     env_lines = ["      - TZ=${TZ:-UTC}"]
     if proxy_enabled:
-        env_lines.append(f"      - HTTP_PROXY=http://{CAVE_NET_PROXY_IP}:8080")
-        env_lines.append(f"      - HTTPS_PROXY=http://{CAVE_NET_PROXY_IP}:8080")
+        env_lines.append(f"      - HTTP_PROXY=http://{proxy_ip}:8080")
+        env_lines.append(f"      - HTTPS_PROXY=http://{proxy_ip}:8080")
         env_lines.append("      - NO_PROXY=localhost,127.0.0.1")
     env_block = "\n".join(env_lines)
+
+    # iptables runs inside the cave only in allowlist mode. In proxy mode
+    # the network topology is the policy, so the capabilities go away.
+    caps_block = "" if internal else """\
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+"""
+    limits_block = "".join(line + "\n" for line in _resource_limits(policy))
+    sidecar_nets = "\n      egress-net: {}" if internal else ""
 
     vol_lines = [
         f"      - {name}-history:/commandhistory",
@@ -997,13 +1228,10 @@ def _generate_compose(name: str, policy: dict) -> str:
     init: true
     stdin_open: true
     tty: true
-    cap_add:
-      - NET_ADMIN
-      - NET_RAW
-    security_opt:
+{caps_block}    security_opt:
       - no-new-privileges:true
       - seccomp:seccomp.json
-    working_dir: /workspace
+{limits_block}    working_dir: /workspace
     labels:
       jedi.cave: {name}
       jedi.session: ${{JEDI_SESSION:-default}}
@@ -1029,7 +1257,7 @@ def _generate_compose(name: str, policy: dict) -> str:
     if dns_mode == "synthetic":
         parts.append(f"""\
     dns:
-      - {CAVE_NET_DNS_IP}""")
+      - {dns_ip}""")
 
     if needs_net:
         parts.append("""\
@@ -1042,11 +1270,17 @@ def _generate_compose(name: str, policy: dict) -> str:
   dns:
     image: coredns/coredns:1.12.0
     command: ["-conf", "/etc/coredns/Corefile"]
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
     volumes:
       - ./Corefile:/etc/coredns/Corefile:ro
     networks:
       cave-net:
-        ipv4_address: {CAVE_NET_DNS_IP}""")
+        ipv4_address: {dns_ip}{sidecar_nets}""")
 
     # --- proxy sidecar (L7 proxy) ---
     if proxy_enabled:
@@ -1061,11 +1295,15 @@ def _generate_compose(name: str, policy: dict) -> str:
   proxy:
     image: mitmproxy/mitmproxy:11
     command: ["mitmdump", "-s", "/policy.py", "--listen-port", "8080", "--set", "confdir=/certs"]
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     volumes:
 {proxy_vols}
     networks:
       cave-net:
-        ipv4_address: {CAVE_NET_PROXY_IP}""")
+        ipv4_address: {proxy_ip}{sidecar_nets}""")
 
     # --- volumes ---
     parts.append(f"""
@@ -1073,15 +1311,20 @@ volumes:
   {name}-history:
   {name}-config:""")
 
-    # --- network ---
+    # --- networks ---
     if needs_net:
+        internal_line = "\n    internal: true" if internal else ""
         parts.append(f"""
 networks:
   cave-net:
-    driver: bridge
+    driver: bridge{internal_line}
     ipam:
       config:
-        - subnet: {CAVE_NET_SUBNET}""")
+        - subnet: {subnet}""")
+        if internal:
+            parts.append("""\
+  egress-net:
+    driver: bridge""")
 
     return "\n".join(parts) + "\n"
 
@@ -1116,12 +1359,13 @@ def _generate_proxy_policy(policy: dict) -> str:
     injects proxy-mode secrets, and runs hooks."""
     domains = _policy_domains(policy)
     secrets = policy.get("secrets") or {}
+    operations = _parse_operations(policy)
 
     # Build secret injection map: placeholder → {value_env_var, domains, headers}
     # Real values are loaded at runtime from /run/secrets/env inside the proxy.
     proxy_secrets = {}
     for sname, cfg in secrets.items():
-        if (cfg or {}).get("inject") == "proxy":
+        if _inject_mode(cfg, policy) == "proxy":
             placeholder = (cfg or {}).get("placeholder", "{{" + sname + "}}")
             proxy_secrets[placeholder] = {
                 "env_var": sname,
@@ -1138,6 +1382,24 @@ def _generate_proxy_policy(policy: dict) -> str:
         "from mitmproxy import http",
         "",
         f"ALLOWED = {set(domains)!r}",
+        "",
+        "# Operation allowlist: host → [(METHOD, /path), ...]. A listed host",
+        "# admits only these; unlisted hosts admit any operation.",
+        f"OPERATIONS = {operations!r}",
+        "",
+        "def _operation_allowed(host, method, path):",
+        "    rules = OPERATIONS.get(host)",
+        "    if rules is None:",
+        "        return True",
+        "    for m, p in rules:",
+        '        if m != "*" and m != method:',
+        "            continue",
+        '        if p.endswith("*"):',
+        "            if path.startswith(p[:-1]):",
+        "                return True",
+        "        elif path == p:",
+        "            return True",
+        "    return False",
         "",
     ]
 
@@ -1188,15 +1450,20 @@ def _generate_proxy_policy(policy: dict) -> str:
         "        if host not in ALLOWED:",
         '            flow.response = http.Response.make(403, b"Blocked by jedicave policy")',
         "            return",
+        '        path = flow.request.path.split("?", 1)[0]',
+        "        if not _operation_allowed(host, flow.request.method, path):",
+        '            flow.response = http.Response.make(403, b"Operation not allowed by jedicave policy")',
+        "            return",
         "",
-        "        # Proxy-mode secret injection",
+        "        # Proxy-mode secret injection. Without an explicit header list,",
+        "        # any header carrying the placeholder is substituted.",
         "        for placeholder, cfg in SECRETS.items():",
         '            if host in cfg["domains"]:',
-        '                if cfg["headers"]:',
-        '                    for h in cfg["headers"]:',
-        "                        if h in flow.request.headers:",
-        "                            flow.request.headers[h] = flow.request.headers[h].replace(",
-        '                                placeholder, cfg["value"])',
+        '                names = cfg["headers"] or list(flow.request.headers.keys())',
+        "                for h in names:",
+        "                    if h in flow.request.headers and placeholder in flow.request.headers[h]:",
+        "                        flow.request.headers[h] = flow.request.headers[h].replace(",
+        '                            placeholder, cfg["value"])',
         "                # Also replace in request body",
         "                if flow.request.content:",
         "                    flow.request.content = flow.request.content.replace(",
@@ -1295,7 +1562,7 @@ def _resolve_proxy_secrets(d: Path, policy: dict) -> None:
 
     proxy_secrets = {
         name: cfg for name, cfg in secrets.items()
-        if (cfg or {}).get("inject") == "proxy"
+        if _inject_mode(cfg, policy) == "proxy"
     }
 
     if not proxy_secrets:
@@ -1323,15 +1590,16 @@ def _resolve_proxy_secrets(d: Path, policy: dict) -> None:
 
 def _write_compose(d: Path, name: str, policy: dict) -> None:
     """Regenerate compose.yml + supporting files for the current policy."""
+    _validate_policy(policy)
     (d / "compose.yml").write_text(_generate_compose(name, policy))
     dst_seccomp = d / "seccomp.json"
     dst_seccomp.unlink(missing_ok=True)
     shutil.copy2(DATA_DIR / "seccomp.json", dst_seccomp)
 
-    if ((policy.get("network") or {}).get("dns") or {}).get("mode") == "synthetic":
+    if _dns_mode(policy) == "synthetic":
         (d / "Corefile").write_text(_generate_corefile(policy))
 
-    if (policy.get("proxy") or {}).get("enabled", False):
+    if _proxy_enabled(policy):
         _generate_proxy_ca(d)
         (d / "proxy-policy.py").write_text(_generate_proxy_policy(policy))
         _resolve_proxy_secrets(d, policy)
@@ -1854,18 +2122,12 @@ def up(
     if env_file:
         console.print(f"[dim]  resolved {len(policy.get('secrets') or {})} secrets → {env_file.name}[/]")
 
-    cenv = compose_env(session)
+    cenv = _net_env(compose_env(session), compose_project(d, name, session))
     base = compose_cmd(d, name, session)
     label = f"{name}/{session}" if session != "default" else name
     console.print(f"Starting cave [cyan]{label}[/]...")
     run(base + ["up", "-d"], cwd=d, env=cenv)
-    if firewall:
-        fw_cmds = firewall_commands(d)
-        run(base + ["exec", "--user", "root", COMPOSE_SERVICE,
-                    "bash", "-c", fw_cmds], cwd=d, env=cenv)
-        console.print(f"[green]Cave '{label}' running (firewall on)[/]")
-    else:
-        console.print(f"[green]Cave '{label}' running[/]")
+    _apply_firewall(d, base, cenv, policy, firewall, f"Cave '{label}' running")
     enter_args = name if session == "default" else f"{name} -s {session}"
     console.print(f"Run: jedi enter {enter_args}")
 
@@ -1973,14 +2235,31 @@ def restart(
     if env_file:
         console.print(f"[dim]  resolved {len(policy.get('secrets') or {})} secrets → {env_file.name}[/]")
 
+    cenv = _net_env(cenv, compose_project(d, name, session))
     run(base + ["up", "-d"], cwd=d, env=cenv)
-    if firewall:
+    _apply_firewall(d, base, cenv, policy, firewall, f"Cave '{label}' restarted")
+
+
+def _apply_firewall(d: Path, base: list[str], cenv: dict, policy: dict,
+                    firewall: bool, done: str) -> None:
+    """Apply the egress policy to a freshly started session and report.
+
+    In allowlist mode that is the iptables rules, run as root inside the
+    shell container. In proxy mode the internal network is the policy and
+    there is nothing to apply; --no-firewall cannot open it.
+    """
+    if _egress_mode(policy) == "proxy":
+        if not firewall:
+            console.print("[yellow]  --no-firewall has no effect: network.egress is 'proxy', "
+                          "the cave has no route out[/]")
+        console.print(f"[green]{done} (egress: proxy-only network)[/]")
+    elif firewall:
         fw_cmds = firewall_commands(d)
         run(base + ["exec", "--user", "root", COMPOSE_SERVICE,
                     "bash", "-c", fw_cmds], cwd=d, env=cenv)
-        console.print(f"[green]Cave '{label}' restarted (firewall on)[/]")
+        console.print(f"[green]{done} (firewall on)[/]")
     else:
-        console.print(f"[green]Cave '{label}' restarted[/]")
+        console.print(f"[green]{done}[/]")
 
 
 @app.command()
@@ -1993,9 +2272,16 @@ def shell(
     """Ephemeral shell (no 'up' needed)."""
     name, d = resolve_cave(name)
     _ensure_image(name)
-    _write_compose(d, name, _load_policy(d))
+    policy = _load_policy(d)
+    _write_compose(d, name, policy)
     project = compose_project(d, name, session)
     os.environ["JEDI_SESSION"] = session
+    _net_env(os.environ, project)
+    if _egress_mode(policy) == "proxy":
+        if not firewall:
+            console.print("[yellow]  --no-firewall has no effect: network.egress is 'proxy', "
+                          "the cave has no route out[/]")
+        firewall = False  # the internal network is the policy; no iptables inside
     if firewall:
         fw_cmds = firewall_commands(d)
         os.execvp("docker", ["docker", "compose", "-p", project,
@@ -2185,12 +2471,26 @@ def firewall(
 
     cenv = compose_env(session)
     base = compose_cmd(d, name, session)
+    policy = _load_policy(d)
+
+    if _egress_mode(policy) == "proxy":
+        # The internal network is the policy: nothing to switch inside the cave.
+        domains = _policy_domains(policy)
+        if action == FirewallAction.off:
+            err_console.print(
+                "[red]Egress is proxy-only by network (network.egress: proxy); "
+                "there are no iptables rules to remove.[/]\n"
+                "Set network.egress: allowlist in policy.yaml and restart to use iptables.")
+            raise typer.Exit(1)
+        console.print("[green]Egress: proxy-only[/] (internal network, no route out; "
+                      f"{len(domains)} domains reachable through the proxy)")
+        return
 
     if action == FirewallAction.on:
         fw_cmds = firewall_commands(d)
         run(base + ["exec", "--user", "root", COMPOSE_SERVICE,
                     "bash", "-c", fw_cmds], cwd=d, env=cenv)
-        domains = _policy_domains(_load_policy(d))
+        domains = _policy_domains(policy)
         console.print(f"[green]Firewall enabled ({len(domains)} domains allowlisted)[/]")
 
     elif action == FirewallAction.off:

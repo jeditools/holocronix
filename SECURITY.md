@@ -10,10 +10,10 @@ This document describes what the jedicave isolates, what it does not, and where 
 | Processes | Isolated | PID/mount/UTS/IPC namespaces |
 | Privileges | Hardened | No sudo, no setuid; firewall rules immutable from container user |
 | NPM scripts | Hardened | Disabled by default (`IGNORE_SCRIPTS=true`, 24h release age gate) |
-| Network | Firewalled by default | Egress restricted to allowlist; use `jedi firewall off` to open |
-| DNS | Configurable | `open` (default), `trusted` (redirect), or `synthetic` (CoreDNS allowlist) |
+| Network | Firewalled by default | iptables allowlist in the cave, or `egress: proxy` for an internal network with no route out |
+| DNS | Filtered by default | `synthetic` (CoreDNS allowlist, default), `trusted` (redirect), or `open` |
 | Kernel | Shared | Host kernel exposed; seccomp blocks AF_ALG (CVE-2026-31431) |
-| Resources | Unlimited | No CPU/memory/PID limits configured |
+| Resources | PIDs limited | `pids: 4096` by default; `cpus` and `memory` set per cave in `policy.yaml` |
 | Git identity | Isolated | Host `~/.gitconfig` not mounted by default |
 | Docker socket | Safe by default | Not mounted, but fatal if added |
 | Cloud metadata | Exposed | `169.254.169.254` reachable from container |
@@ -23,16 +23,19 @@ This document describes what the jedicave isolates, what it does not, and where 
 |------------------------|--------|
 | Seccomp profile | Blocks AF_ALG and other unnecessary syscalls (CVE-2026-31431) |
 | `no-new-privileges` | Blocks privilege escalation via setuid/execve |
-| DNS filtering (CoreDNS) | `dns.mode: synthetic` in `policy.yaml` |
+| DNS filtering (CoreDNS) | `dns.mode: synthetic` in `policy.yaml`, the default for new caves |
+| Internal-network egress | `network.egress: proxy`: no route out of the cave, no `NET_ADMIN` inside it |
+| Model API operation allowlist | `proxy.operations`: a listed host admits only named `METHOD /path` pairs |
+| Sidecar hardening | CoreDNS and mitmproxy run with capabilities dropped and `no-new-privileges` |
+| PID limit | `resources.pids` in `policy.yaml`, 4096 by default |
 
 | Future hardening | Impact |
 |------------------|--------|
-| Resource limits (cgroup) | Prevents fork bombs, memory exhaustion |
+| CPU and memory limits by default | Today opt-in per cave via `resources` |
 | Read-only root filesystem | Prevents persistent container modifications |
-| Cloud metadata blocking | Prevents IAM credential leaks on cloud hosts |
+| Cloud metadata blocking | Prevents IAM credential leaks on cloud hosts in allowlist mode |
 | User namespace remapping | Maps container root to unprivileged host UID |
-| Default-deny egress | Internal network with proxy-only egress and no `NET_ADMIN`; port-matched allowlist otherwise |
-| Model API operation allowlist | Proxy refuses API operations the agent does not need |
+| Port-matched allowlist rules | In allowlist mode, drop non-HTTPS ports on allowlisted IPs and private ranges |
 | gVisor, Kata Containers, or a microVM runtime | Separate kernel from the host; Docker for the agent; see [RELATED-WORK.md](RELATED-WORK.md) |
 | Volume integrity checks | Detects tampering between sessions |
 | Audit logging | Supports post-incident analysis |
@@ -61,17 +64,17 @@ The `no-new-privileges` security option is also applied, preventing processes fr
 
 The firewall is enabled by default, restricting outbound access to allowlisted domains. It can be disabled with `jedi firewall off` or `--no-firewall`. Even with the firewall enabled:
 
-- **DNS tunneling (in `open` mode).** By default (`dns.mode: open` in `policy.yaml`), DNS queries resolve for all domains. A malicious process could use DNS tunneling to exfiltrate data. Set `dns.mode: synthetic` to run a CoreDNS sidecar that only resolves allowlisted domains (everything else returns NXDOMAIN), or `dns.mode: trusted` to redirect DNS to specific resolvers via iptables DNAT.
+- **DNS tunneling (in `open` mode).** With `dns.mode: open` in `policy.yaml`, DNS queries resolve for all domains and a malicious process could tunnel data through them. New caves default to `dns.mode: synthetic`, a CoreDNS sidecar that only resolves allowlisted domains (everything else returns NXDOMAIN). `dns.mode: trusted` redirects DNS to specific resolvers via iptables DNAT, which is lighter but does not prevent tunneling.
 - **Exfiltration via allowed domains.** Data can be exfiltrated through any allowlisted endpoint. For example, if `github.com` is allowed, a process could push data to an attacker-controlled repository.
 - **IP-based bypass.** The iptables rules use domain names, which are resolved to IPs at rule-creation time. If a domain resolves to multiple IPs or changes its DNS records after rules are applied, traffic may be allowed or blocked unexpectedly.
-- **Every port on an allowlisted IP.** An allowlist entry becomes `iptables -A OUTPUT -d <ip> -j ACCEPT` with no protocol or port match, so it admits SSH, UDP, or any custom service on that IP, not just HTTPS. With the L7 proxy enabled, only ports 80 and 443 are forced through the proxy; other ports on allowlisted IPs still bypass HTTP-level policy, hooks, and secret handling. Compare Gondolin's userspace network stack, which drops any TCP flow it cannot classify as HTTP, TLS, SSH, or an explicit mapping (see [RELATED-WORK.md](RELATED-WORK.md)).
-- **Cloud metadata services.** On cloud instances (AWS, GCP, Azure), the instance metadata endpoint (`169.254.169.254`) is reachable from inside the container by default. This can leak IAM credentials, instance identity tokens, and other sensitive data. The default firewall rules do not block this endpoint.
+- **Every port on an allowlisted IP.** An allowlist entry becomes `iptables -A OUTPUT -d <ip> -j ACCEPT` with no protocol or port match, so it admits SSH, UDP, or any custom service on that IP, not just HTTPS. With the L7 proxy enabled, only ports 80 and 443 are forced through the proxy; other ports on allowlisted IPs still bypass HTTP-level policy, hooks, and secret handling. Compare Gondolin's userspace network stack, which drops any TCP flow it cannot classify as HTTP, TLS, SSH, or an explicit mapping (see [RELATED-WORK.md](RELATED-WORK.md)). With `network.egress: proxy` the cave has no route to any IP at all, so this gap closes; see "Internal-network egress" below.
+- **Cloud metadata services.** On cloud instances (AWS, GCP, Azure), the instance metadata endpoint (`169.254.169.254`) is reachable from inside the container in allowlist mode. This can leak IAM credentials, instance identity tokens, and other sensitive data. The default firewall rules do not block this endpoint. With `network.egress: proxy` it is unreachable, like everything else outside the sidecar network.
 
 ### Secrets
 
-`policy.yaml` supports two injection modes. In `env` mode (the default) the real value is resolved on the host and passed into the shell container's environment, where any process, including code the agent runs, can read it and send it to any allowlisted endpoint. In `proxy` mode the container only sees a placeholder; the real value lives in the proxy sidecar and is substituted into matching headers for the configured domains, so the secret never enters the agent's environment. Proxy mode requires `proxy.enabled: true` and is the mode to prefer for anything beyond the LLM API key.
+`policy.yaml` supports two injection modes. In `env` mode the real value is resolved on the host and passed into the shell container's environment, where any process, including code the agent runs, can read it and send it to any allowlisted endpoint. In `proxy` mode the container only sees a placeholder; the real value lives in the proxy sidecar and is substituted into any header carrying the placeholder (or the listed `headers`) for the configured domains, so the secret never enters the agent's environment. A secret that names no `inject` mode uses `proxy` when `proxy.enabled` is true and `env` otherwise, so enabling the proxy is the one opt-in.
 
-Proxy mode controls where a secret goes, not what it is used for. Any request to an allowed domain gets the header, including account, admin, or file endpoints the agent never needs. See "Model API operation allowlist" under "Future hardening".
+Proxy mode controls where a secret goes. What it is used for is bounded by `proxy.operations`, which limits a listed host to the `METHOD /path` pairs the agent needs (see "Model API operation allowlist" under "Implemented hardening"). Hosts without an entry admit any operation.
 
 ### Docker socket
 
@@ -98,13 +101,13 @@ Any path added via `jedi mount` is writable by default. A compromised process in
 
 ### Resource limits
 
-No CPU, memory, or disk limits are configured by default. A runaway or malicious process can exhaust host resources (fork bombs, memory allocation, disk fill via mounted volumes).
+The shell container gets a PID limit by default (`resources.pids` in `policy.yaml`, 4096), which stops fork bombs. CPU and memory limits are per cave (`resources.cpus`, `resources.memory`) and unset by default, so a runaway build can still exhaust host memory, and nothing limits disk fill through volumes.
 
 ### NET_ADMIN capability
 
 The container is granted `NET_ADMIN` and `NET_RAW` capabilities to support iptables-based firewall rules. These capabilities also allow the container's root user (accessible via `docker compose exec --user root`) to manipulate network interfaces, routing tables, and raw sockets. The unprivileged container user cannot exercise these capabilities directly, but they expand the attack surface if a privilege escalation vulnerability exists.
 
-Both capabilities exist only because the egress policy is enforced inside the container. With the internal-network design under "Default-deny egress" below, no iptables runs inside the cave and both can be dropped.
+Both capabilities exist only because the egress policy is enforced inside the container. With `network.egress: proxy` no iptables runs inside the cave and neither capability is granted (see "Internal-network egress" below).
 
 ### Named volumes
 
@@ -172,22 +175,31 @@ The profile source is `config/seccomp.json`, installed alongside the CLI via Nix
 
 Applied via `security_opt: [no-new-privileges:true]` in compose. Prevents processes from gaining additional privileges via setuid binaries, `execve`, or other mechanisms. Combined with Nix stripping setuid bits, this ensures no privilege escalation path exists within the container.
 
+### Internal-network egress
+
+`network.egress: proxy` in `policy.yaml` puts the cave on a compose network marked `internal: true`, which Docker creates with no route to the outside, and attaches only the proxy and DNS sidecars to a second, external network. The cave can reach nothing but those two containers, every byte that leaves is HTTP or TLS the proxy has seen, and the shell container gets no `NET_ADMIN` or `NET_RAW` because nothing inside it programs a firewall. `jedi firewall` has nothing to switch in this mode and `--no-firewall` cannot open the network; the policy file is the only way out. It requires `proxy.enabled: true` and `dns.mode: synthetic`, and `jedi up` refuses any other combination. This is the in-Docker equivalent of Gondolin's host-terminated network (see [RELATED-WORK.md](RELATED-WORK.md)).
+
+Each compose project gets its own /28 for the sidecar network, derived from the project name and moved past any Docker network that already covers it, so several caves or sessions with sidecars can run at once.
+
+### Model API operation allowlist
+
+`proxy.operations` lists, per host, the `METHOD /path` pairs the agent uses, and the proxy answers 403 to anything else on that host before it leaves. For `api.anthropic.com` that is `POST /v1/messages` and `POST /v1/messages/count_tokens`. A key that is stolen from the container, or driven by an injected prompt, then cannot reach account, admin, or file endpoints through the cave. Hosts without an entry are unrestricted. Borrowed from coop's credential proxy, which ships the same closed list (see [RELATED-WORK.md](RELATED-WORK.md)).
+
+### Sidecar hardening
+
+The CoreDNS and mitmproxy sidecars run with every capability dropped (CoreDNS keeps `NET_BIND_SERVICE` for port 53) and `no-new-privileges`. The proxy holds the real secrets, so it is the container a compromised cave would try next.
+
+### PID limit
+
+`resources.pids` in `policy.yaml` caps the shell container's process count, 4096 by default. `resources.cpus` and `resources.memory` add cgroup CPU and memory limits when set.
+
 ## Future hardening
 
 The following improvements would strengthen isolation. They are listed roughly in order of impact-to-effort ratio.
 
-### Resource limits
+### CPU and memory limits by default
 
-Add default CPU, memory, and PID limits to `compose.yml`:
-
-```yaml
-deploy:
-  resources:
-    limits:
-      cpus: '4'
-      memory: 8G
-      pids: 4096
-```
+`resources.cpus` and `resources.memory` are unset by default because a fixed cap breaks large builds: a Rust link step can exceed 8 GiB. The remaining step is a default derived from the host's size rather than a constant.
 
 ### Read-only root filesystem
 
@@ -197,22 +209,15 @@ Run the container with `read_only: true` and use tmpfs mounts for writable paths
 
 Set `network.dns.mode: synthetic` in `policy.yaml` to deploy a CoreDNS sidecar that only resolves allowlisted domains (returns NXDOMAIN for everything else). This closes the DNS tunneling gap. Alternatively, `dns.mode: trusted` redirects DNS to specified resolvers via iptables DNAT — lighter, but does not prevent tunneling.
 
-### Default-deny egress
+### Default-deny egress in allowlist mode
 
-The strongest form needs no iptables at all. Put the cave on a compose network marked `internal: true`, which Docker creates with no route to the outside, and attach only the proxy and DNS sidecars to a second, external network. The cave can then reach nothing but those two containers, every byte that leaves is HTTP or TLS the proxy has seen, and `NET_ADMIN` and `NET_RAW` can be dropped from the container because nothing inside it needs to program the firewall. This is the in-Docker equivalent of Gondolin's host-terminated network, and it is the first item in the "Runtime isolation" section of [ROADMAP.md](ROADMAP.md).
-
-For caves that run without the proxy, tighten the generated firewall so an allowlist entry admits only what the policy actually needs:
+The strongest form, an internal network with the proxy as the only way out, is implemented as `network.egress: proxy` (see "Internal-network egress"). For caves that stay in allowlist mode, tighten the generated firewall so an allowlist entry admits only what the policy actually needs:
 
 - When the L7 proxy is enabled, accept only the proxy IP and DNS, and drop everything else. Today allowlisted IPs are still accepted on every port, so only 80 and 443 are actually mediated.
 - Without the proxy, match allowlist rules on `-p tcp --dport 443` (plus 80 or 22 where a domain needs them) instead of accepting all protocols and ports.
 - Block RFC 1918 and link-local ranges by default, so an allowlisted public domain that resolves to a private address cannot reach LAN services.
-- Default `dns.mode` to `synthetic` rather than `open`.
 
 This is the iptables approximation of what Gondolin gets by construction from its userspace network stack (see [RELATED-WORK.md](RELATED-WORK.md)).
-
-### Model API operation allowlist
-
-With the L7 proxy enabled, restrict each allowlisted model host to the operations the agent actually performs and answer everything else with 403 before it leaves the proxy. For `api.anthropic.com` that is `POST /v1/messages` and `POST /v1/messages/count_tokens`. A key that is stolen from the container, or driven by an injected prompt, then cannot reach account, admin, or file endpoints through the cave. Today the `block` hook matches only on body size, so this is a small addition to the generated `proxy-policy.py`. coop's credential proxy ships with exactly this closed list and requires review to widen it (see [RELATED-WORK.md](RELATED-WORK.md)).
 
 ### Cloud metadata blocking
 

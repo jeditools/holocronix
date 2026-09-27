@@ -84,7 +84,7 @@ jedi init dagobah
 This scaffolds `~/.config/jedicaves/dagobah/` with:
 - `flake.nix` — references holocronix + your project inputs
 - `compose.yml` — container runtime config
-- `firewall-defaults.conf` — domain allowlist
+- `policy.yaml` — network, secrets, proxy, and resource policy
 
 ### 3. Configure the cave
 
@@ -189,7 +189,7 @@ When only one cave exists, the name can be omitted.
 ├── flake.nix                  ← imports holocronix + project
 ├── flake.lock
 ├── compose.yml                ← container runtime config
-├── firewall-defaults.conf     ← domain allowlist
+├── policy.yaml                ← network, secrets, proxy, resources
 └── repos/
     └── foo.git/               ← bare repo (seeded from host)
 ```
@@ -264,8 +264,10 @@ Add more inputs and shells — deps are merged (assumes compatible toolchains):
 ## Network Isolation
 
 The firewall is **enabled by default** — caves start with egress restricted
-to an allowlist of domains. The default allowlist (`firewall-defaults.conf`)
-permits only `api.anthropic.com`. Edit it to add more domains.
+to an allowlist of domains. `policy.yaml` in the cave directory holds the
+allowlist (only `api.anthropic.com` at first), the DNS mode (`synthetic`
+by default: only allowlisted names resolve), secrets, the L7 proxy, and
+cgroup limits. Edit it and run `jedi up` again.
 
 Rules are applied as root — the unprivileged container user cannot modify
 or disable them.
@@ -282,6 +284,12 @@ To start a cave without the firewall:
 jedi up --no-firewall dagobah
 jedi shell --no-firewall dagobah
 ```
+
+For the strongest form, set `network.egress: proxy` together with
+`proxy.enabled: true`. The cave then sits on an internal network with no
+route out; the proxy and DNS sidecars are its only neighbours, nothing
+inside the cave needs `NET_ADMIN`, and `--no-firewall` has no effect. See
+[SECURITY.md](SECURITY.md), "Internal-network egress".
 
 ## Rebuilding After Changes
 
