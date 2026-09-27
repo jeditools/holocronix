@@ -22,8 +22,9 @@
 ;;; - Claude Code embeds a ripgrep with the same problem.
 ;;;   USE_BUILTIN_RIPGREP=0 makes it use the rg on PATH, Guix's.
 ;;;
-;;; x86_64-linux only for now.  llm-agents.nix's hashes.json has the
-;;; aarch64-linux hash of the same release (URL platform `linux-arm64').
+;;; x86_64-linux only for now.  nixpkgs' claude-code package records the
+;;; other platforms' hashes for the same release (URL platform
+;;; `linux-arm64', `darwin-arm64', ...).
 
 (define-module (holocronix agents)
   #:use-module (guix packages)
@@ -34,6 +35,7 @@
   #:use-module (gnu packages base)
   #:use-module (gnu packages bash)
   #:use-module (gnu packages bootstrap)
+  #:use-module (gnu packages compression)
   #:use-module (gnu packages rust-apps)
   #:export (claude-code
             %jedicave-default-agents
@@ -60,24 +62,30 @@ program interpreter: the FHS location the vendor linked against."
 ;;;
 
 (define %claude-code-releases
-  "https://storage.googleapis.com/\
-claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/")
+  ;; Anthropic's download host, the one nixpkgs fetches from.  Each release
+  ;; directory holds the executable as `claude' and as `claude.zst', the
+  ;; latter about a quarter of the size.  llm-agents.nix fetches the plain
+  ;; file from the storage.googleapis.com bucket claude-code-dist-86c565f3-
+  ;; f756-42ad-8dfa-d59b1c096819/claude-code-releases/ instead.
+  "https://downloads.claude.ai/claude-code-releases/")
 
 (define-public claude-code
   (package
     (name "claude-code")
-    ;; Same pin as flake.nix: the `stable' npm tag with about ten days of
-    ;; soak.  Bump deliberately, after checking the release's age.  The hash
-    ;; is the release file's as llm-agents.nix records it (hashes.json),
-    ;; re-derived here from the bytes Nix fetched for it.
-    (version "2.1.231")
+    ;; The version nixpkgs shipped on 2026-09-27, then the `latest' tag.
+    ;; flake.nix pins llm-agents.nix at 2.1.231, the `stable' tag with soak;
+    ;; the two move independently.  Bump deliberately.  The hash is the
+    ;; release file's as nixpkgs records it, re-derived from the bytes Nix
+    ;; fetched for it.
+    (version "2.1.283")
     (source
      (origin
        (method url-fetch)
-       (uri (string-append %claude-code-releases version "/linux-x64/claude"))
-       (file-name (string-append "claude-code-" version "-linux-x64"))
+       (uri (string-append %claude-code-releases version
+                           "/linux-x64/claude.zst"))
+       (file-name (string-append "claude-code-" version "-linux-x64.zst"))
        (sha256
-        (base32 "0nyyxhc41wk125rh11md55q65q2vdsnpa61xq636qkvrpyp1v827"))))
+        (base32 "1sr5z91kc7m5qzrlxkacq427dimiync4yjckhdxddqwbx1hmhd4l"))))
     (build-system copy-build-system)
     (arguments
      (list
@@ -94,9 +102,10 @@ claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/")
       #:phases
       #~(modify-phases %standard-phases
           (replace 'unpack
-            ;; The source is the executable itself, not an archive.
+            ;; The source is the executable itself, zstd-compressed; not an
+            ;; archive.
             (lambda* (#:key source #:allow-other-keys)
-              (copy-file source "claude")
+              (invoke "zstd" "-d" "-q" "-o" "claude" source)
               (chmod "claude" #o755)))
           (add-after 'install 'wrap
             (lambda* (#:key inputs outputs #:allow-other-keys)
@@ -146,6 +155,7 @@ fi
                 (close-pipe port)
                 (unless (and (string? line) (string-contains line #$version))
                   (error "claude --version did not report" #$version line))))))))
+    (native-inputs (list zstd))
     (inputs (list bash-minimal glibc ripgrep))
     (supported-systems '("x86_64-linux"))
     (home-page "https://claude.com/claude-code")

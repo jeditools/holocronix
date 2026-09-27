@@ -528,9 +528,12 @@ another marketplace adds a `(marketplace ...)` record to `#:marketplaces`.
 ### The binary
 
 Anthropic ships Claude Code as a single executable built with Bun, and
-that is what llm-agents.nix packages, so the Guix package fetches the same
-release file (2.1.231, the pin in `flake.nix`) and leaves it unmodified.
-The usual prebuilt-binary treatment does not apply: `patchelf
+that is what nixpkgs and llm-agents.nix package too, so the Guix package
+fetches the release file, zstd-compressed from Anthropic's download host
+as nixpkgs does, and leaves the executable unmodified. The version is
+2.1.283, what nixpkgs shipped on 2026-09-27; `flake.nix` pins llm-agents.nix
+at 2.1.231, and the two move independently. The usual prebuilt-binary
+treatment does not apply: `patchelf
 --set-interpreter` relocates the program headers, and the Bun executable
 segfaults on start afterwards. llm-agents.nix uses its own `wrap-buddy`
 tool instead of patchelf for the same reason.
@@ -601,12 +604,13 @@ jedi update my-cave
 jedi build my-cave
 jedi up my-cave
 jedi enter my-cave
-claude --version                     # 2.1.231 (Claude Code)
+claude --version                     # 2.1.283 (Claude Code)
 ls -la /lib64 /env/.claude-plugin-seed
 ```
 
 A test image with the base tools trimmed to nine packages plus Claude Code
-came to a 470 MB tarball and 1.3 GB loaded; Claude Code is 311 MB of that.
+2.1.231 came to a 470 MB tarball and 1.3 GB loaded, 311 MB of it Claude
+Code. 2.1.283 is 241 MB unpacked and an 85 MB download.
 
 ### The other agents
 
