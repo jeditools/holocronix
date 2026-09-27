@@ -188,6 +188,228 @@ the SDK via `imagePath`.
   `docs/architecture.md`, `docs/qemu.md`, `docs/backends.md`
 - Gondolin `builtin-image-registry.json` and `images/alpine-base.json`
 
+## coop
+
+Reviewed 2026-09-27.
+
+| Project | Reviewed at | What it is |
+|---------|-------------|------------|
+| [coop](https://github.com/trailofbits/coop) | v0.6.0 (2026-09-09), main at `6ac6c2c5e739` (2026-09-26) | Rust CLI from Trail of Bits, Apache-2.0, that runs Claude Code and Codex in Firecracker microVMs on Linux and Lima VMs on macOS |
+
+coop is a serious codebase: about 46,000 lines of Rust in the main crate
+with tests included, 1,225 unit tests, fuzz targets, bounded proofs under
+kani, mutation testing, and integration suites that run on both
+backends. It has 15 tags since its first commit on 2026-04-02. It
+supports two agents, Claude Code and Codex, and nothing else. Its
+`docs/trust-model.md` is the clearest statement of trust boundaries and
+taint sources of any project reviewed here.
+
+### How a coop run works
+
+`coop setup` builds a golden image once per image name:
+
+1. On Linux, download the latest Firecracker release tarball from
+   GitHub, then a minimal CI kernel (6.1 series at review time) and an
+   Ubuntu-based CI squashfs rootfs from Firecracker's public S3 bucket.
+   The setup code checks no checksum on any of the three. On macOS, a
+   Lima template names the Ubuntu 24.04 cloud image by URL without a
+   digest.
+2. Unpack the rootfs into an 8 GiB ext4 image and provision it in a
+   chroot on the host (Linux) or a throwaway builder VM (macOS): apt
+   installs Docker CE, the GitHub CLI, `build-essential` and friends;
+   Claude Code and Codex come from their vendors' `curl | bash`
+   installers; profiles add apt packages and run `pre_install` and
+   `post_install` shell as root with network; devcontainer Features are
+   pulled from GHCR and their `install.sh` run.
+3. Write `template-config.json`: a version counter, a SHA-256 of the
+   composed install *script*, the post-install script hash, and the
+   profile and plugin lists. A later `coop setup` rebuilds only when
+   that recipe hash changes. Agent versions are not part of it.
+
+`coop up <dir>` then creates and boots an instance:
+
+1. Reflink-copy the template to the instance rootfs, patch the static
+   IP and hostname, grow the disk if asked.
+2. On Linux, create a TAP device on a `br0` bridge at `172.16.0.1/24`,
+   mark the port isolated, insert a `FORWARD` drop for bridge-to-bridge
+   traffic, add `MASQUERADE`, and start Firecracker under `sudo`. The
+   jailer binary is downloaded but not used; Firecracker's built-in
+   seccomp filter applies by default. On macOS, `limactl start` with
+   `vmType: vz` and a per-instance user-mode network.
+3. Wait for SSH with a per-installation ed25519 key and host-key
+   checking disabled.
+4. Bootstrap the agents: `gh auth setup-git` if a GitHub token is
+   configured, overlay an allowlist of `~/.claude` content, write a
+   managed `settings.json` with `bypassPermissions`, install the delta
+   of marketplaces, plugins, and MCP servers not already baked in.
+5. Bring in the workspace: by default a tar-pipe copy of the project
+   directory, `.git` included, into `/workspace` on the guest disk with
+   SHA-256 checked on both ends; or `--mount` (live virtiofs on Lima,
+   one-time rsync on Firecracker); or `--git-repo` cloned inside.
+
+The instance is long-lived: `coop claude`, `coop codex`, `coop shell`,
+and `coop exec` go over SSH; `coop push` and `coop pull` rsync with dirty
+checks on both sides; `coop commit` and `coop restore` snapshot the disk;
+`coop editor` attaches VS Code or Zed; `coop resize` changes disk, RAM,
+and vCPUs. Defaults are 2 vCPUs, 4 GiB of RAM, and an 8 GiB disk. Up to
+253 instances share the bridge subnet.
+
+### coop's runtime model
+
+**Isolation.** Firecracker on KVM, or Apple's Virtualization framework
+through Lima. The VM is the stated boundary and the guest is deliberately
+permissive: passwordless `sudo`, agents in bypass mode, a full Docker
+daemon inside the guest, and a `root:root` serial console. Guests cannot
+reach each other, enforced by two independent controls that are asserted
+on every start and fail closed. Guests can reach the host by design. On
+Linux the host side needs `sudo` for Firecracker, TAP and bridge setup,
+iptables, and the setup chroot with its loop mounts. Out of scope by
+policy: attackers who already control the host, and bugs in Firecracker,
+Lima, Docker, or the agents.
+
+**Network.** Open egress. Guest traffic is NATed through the host's
+default interface with no allowlist, no port matching, and no DNS
+filtering; egress control is coop's open issue #2. On Firecracker the
+guest's resolvers are hard-coded to Google's. Port forwards bind
+`127.0.0.1` only.
+
+**Secrets.** By default the model API keys ride SSH `SendEnv` into the
+guest's environment: never on the guest disk, but readable by anything
+the agent runs. `GITHUB_TOKEN` is off by default; when enabled, `gh auth
+setup-git` turns it into persistent guest state. Config values use a
+`cmd:` prefix so the plaintext lives in Keychain, 1Password, Secret
+Service, or a mode-0600 file, the same idea as our `value_cmd`. The
+opt-in `[proxy]` mode is the strong part: a host-side `coop-proxy`
+process binds loopback, is reverse-tunnelled into the guest over
+`ssh -R`, and the guest holds only a per-instance capability token. The
+proxy checks the token in constant time, injects the real key, and
+default-denies every operation except three method-and-path pairs
+(`POST /v1/messages`, `POST /v1/messages/count_tokens`, `POST
+/v1/responses`) to a pinned upstream over verified TLS. It is jailed
+with Landlock on Linux (no filesystem writes, no exec, TCP egress
+limited to 443 and 53 on kernels 6.7 and later) or Seatbelt on macOS,
+and refuses to start if the jail cannot be applied. coop is explicit
+that this stops key exfiltration, not key use, and provides no egress
+control.
+
+**Workspace.** The guest disk holds `/workspace`; the host directory is
+copied in and pulled back. `.git` goes both ways by default, and coop
+names `pull` as "the widest guest-to-host channel". Its own docs record
+that a guest can write `core.hooksPath` or `core.worktree` into a shared
+`.git/config` and that `pull` can carry such entries back to the host.
+
+**Persistence.** Instances survive stop and start. `commit` and
+`restore` are disk-only checkpoints of a stopped instance.
+
+**Images.** coop builds its own Ubuntu rootfs and nothing else. The
+devcontainer `image` and `build` keys are reported as unsupported, and
+there is no way to boot a supplied OCI image or rootfs.
+
+**Tool provenance.** `coop update` requires a matching `SHA256SUMS` and
+verifies a Sigstore build attestation when `gh` is present. The trust
+model documents what that chain does and does not pin, including that
+any workflow in the repo could mint a passing bundle.
+
+### Side by side
+
+| Dimension | jedicave (Nix/Guix image, Docker runtime) | coop (Firecracker or Lima VM) |
+|-----------|--------------------------------------------|-------------------------------|
+| Isolation boundary | Host kernel, namespaces, seccomp, `no-new-privileges` | Separate guest kernel under Firecracker or Virtualization.framework |
+| Egress control | iptables allowlist by IP, all ports; optional mitmproxy for 80/443 | None; NAT to the internet, open issue #2 |
+| DNS | `open` by default; `trusted` or `synthetic` opt-in | Hard-coded public resolvers, no filtering |
+| Secrets | `env` mode by default; `proxy` mode substitutes headers for allowed domains | `SendEnv` by default; opt-in jailed host proxy with a three-operation allowlist and capability token |
+| Resource limits | None by default | Fixed by VM sizing |
+| Host privileges | Docker daemon, `NET_ADMIN` in the container | `sudo` for Firecracker, TAP, iptables, and the setup chroot; none on macOS |
+| Image provenance | Content-addressed derivation, every input pinned | Recipe hash over the install script; apt, vendor installers, Firecracker binary, kernel, and rootfs all fetched unpinned and unverified |
+| Toolchains | Baked, including cross toolchains and vendored crates; offline builds | apt profiles and rustup at setup; project dependencies fetched by the agent at run time |
+| Docker for the agent | Not available; mounting the socket is root on the host | Full daemon inside the guest |
+| Workspace | Bare repo mounted read-only, cloned inside; host `.git` never exposed | Host directory copied in and pulled back with `.git`; live virtiofs on macOS |
+| Workload shape | Long-lived cave, `exec`, `enter`, tmux, named volumes | Long-lived instance, `shell`, `exec`, editor over SSH, disk checkpoints, resize |
+| Agents | Claude Code, OpenCode, Qwen Code, Kimi, configurable | Claude Code and Codex |
+| Platforms | Linux x86_64 | Linux x86_64 and arm64 (KVM), macOS Apple Silicon |
+| Guest-to-guest | Separate compose networks per cave | Isolated bridge ports plus a `FORWARD` drop, asserted per start |
+| Engineering | Python CLI, tested on one host setup | 46k lines of Rust, unit, fuzz, mutation, kani, integration on both backends |
+
+### Where coop is stronger
+
+- **The boundary, and Docker behind it.** Same argument as Gondolin,
+  plus one we could not make there: an agent can use `docker` because
+  the daemon runs inside the guest. Our `SECURITY.md` can only say the
+  socket must never be mounted.
+- **The credential proxy.** Ours substitutes secrets and applies hooks;
+  theirs also refuses every API operation the agent does not need, holds
+  the key in a process that cannot write files or exec, and fails closed
+  when that jail is unavailable. A stolen key used against the account or
+  files API is blocked at the proxy, not just logged.
+- **The trust model as a document.** Zones, taint sources, invariants
+  the type system enforces, and a stop-and-confirm checklist for changes
+  that widen a boundary. Every accepted trade-off is written down with
+  its rationale.
+- **Workflow surface.** Multiple instances per project, push and pull
+  with dirty checks in both directions, disk checkpoints, editor
+  attachment, port forwards, resize, and a `devcontainer.json` subset
+  that maps onto its own primitives.
+- **Hard resource caps and macOS**, as with vmpi.
+
+### Where holocronix is stronger
+
+- **Reproducible identity.** A coop image is whatever apt, two `curl |
+  bash` installers, the profile scripts, and GHCR served on the day it
+  was built, on top of an unverified rootfs and kernel, run by an
+  unverified Firecracker binary. The recipe hash detects config drift,
+  not upstream drift, and the agents' versions are outside it. Two
+  people running `coop setup` get two different images, and neither can
+  be rebuilt later.
+- **Egress control exists.** coop has none. Everything the agent runs
+  can reach anything, and the credential proxy's own docs say it does
+  not change that.
+- **The host repository is never exposed.** coop copies `.git` in and
+  pulls it back, and documents the hook-path and worktree corruption
+  that follows. The bare-repo handoff and bundle harvest exist for
+  exactly this.
+- **Build isolation.** Our image is built by Nix or Guix in a sandbox
+  with no network beyond hash-pinned fetches. coop's Linux image is
+  provisioned in a chroot on the host, as root, with network, running
+  vendor install scripts; its trust model notes that a chroot is not VM
+  isolation.
+- **Baked toolchains and offline builds**, and more agents.
+- **Guest-side hardening.** Unprivileged user, seccomp, no setuid, no
+  `sudo`. coop does not need this under its model, but it means a cave
+  degrades more gracefully if the boundary is ever the wrong one.
+
+### What we take from it
+
+- **Not coop as a runtime.** It cannot boot an image we build. But
+  Firecracker is now a second candidate microVM backend next to
+  Gondolin, and coop's host networking (`network.rs`: bridge, TAP,
+  isolated ports, NAT) is the reference for what a Firecracker backend
+  would need. Under such a backend our iptables allowlist moves from
+  inside the container to the host's `FORWARD` chain, and `NET_ADMIN`
+  leaves the guest. The Gondolin-versus-Firecracker trade-off is in
+  `ROADMAP.md` under "Runtime isolation".
+- **Docker inside the guest** is the concrete capability a VM runtime
+  buys that no container hardening can.
+- **An operation allowlist in the L7 proxy.** With the proxy on, restrict
+  allowlisted model hosts to the method-and-path pairs the agent uses and
+  return 403 for the rest. Cheap in `proxy-policy.py`; listed in
+  `SECURITY.md` under "Future hardening".
+- **Taint sources in `SECURITY.md`.** Name every guest-to-host channel
+  (harvest, `jedi diff`, `jedi cp`, writable mounts) the way coop does,
+  so a change that adds one is visible.
+- **Not `cmd:` secrets.** `value_cmd` already does this.
+
+### Sources
+
+- coop at commit `6ac6c2c5e739`: `README.md`, `SECURITY.md`,
+  `AGENTS.md`, `docs/ARCHITECTURE.md`, `docs/trust-model.md`,
+  `docs/backends.md`, `docs/images-and-profiles.md`,
+  `docs/workspaces.md`, `docs/credential-proxy.md`,
+  `docs/platform-notes.md`, `docs/devcontainer.md`,
+  `docs/getting-started.md`, `docs/multi-instance.md`,
+  `docs/claude-integration.md`, `docs/design/issue-411-injecting-proxy.md`
+- coop source: `src/setup.rs`, `src/vm.rs`, `src/network.rs`,
+  `src/lima.rs`, `scripts/guest/*.sh`, `guest/init.sh`, `Cargo.toml`
+
 ## stagex
 
 Reviewed 2026-09-22.

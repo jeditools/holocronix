@@ -411,8 +411,8 @@ agents run commands without confirmation. This is safe because the
 container itself is the sandbox boundary.
 
 For a detailed analysis, see [SECURITY.md](SECURITY.md). For how this
-container-based design compares with microVM sandboxes such as `vmpi`
-and Gondolin, see [RELATED-WORK.md](RELATED-WORK.md).
+container-based design compares with microVM sandboxes such as `vmpi`,
+Gondolin, and Trail of Bits' `coop`, see [RELATED-WORK.md](RELATED-WORK.md).
 
 ## Container Details
 

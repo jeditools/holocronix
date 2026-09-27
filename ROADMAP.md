@@ -120,9 +120,12 @@ protect. The image is plain OCI, so the runtime is a pluggable choice
 that leaves the Nix and Guix baking layers untouched.
 
 `RELATED-WORK.md` compares the current design with `vmpi`, a QEMU
-microVM sandbox built on Gondolin. The short version: it wins on the
-isolation boundary and on network policy, we win on reproducible
-images, baked toolchains, and the git handoff. The two compose.
+microVM sandbox built on Gondolin, and with `coop`, Trail of Bits'
+Firecracker and Lima sandbox. The short version: both win on the
+isolation boundary, Gondolin also on network policy, coop also on its
+credential proxy and on Docker inside the guest; we win on reproducible
+images, baked toolchains, egress control over coop, and the git handoff.
+The designs compose.
 
 ### Status
 
@@ -130,7 +133,9 @@ images, baked toolchains, and the git handoff. The two compose.
 |------|-------|
 | gVisor or Kata via `runtime:` in `compose.yml` | Not started. Drop-in for the compose layer. |
 | Gondolin as a microVM backend | Evaluated. Spike planned, see below. |
+| Firecracker as a microVM backend | Evaluated through coop. Second candidate, see "Gondolin or Firecracker". |
 | Default-deny egress in `policy.yaml` | Planned. See `SECURITY.md`, "Default-deny egress". |
+| Model API operation allowlist in the proxy | Planned. See `SECURITY.md`, "Model API operation allowlist". |
 | Secrets default to proxy mode | Planned. |
 | cgroup limits in `compose.yml` | Planned. See `SECURITY.md`, "Resource limits". |
 
@@ -162,15 +167,41 @@ whether the cave workflow survives. Questions to answer, in order:
 Not on the table: adopting `vmpi` itself. It is a thin, `pi`-only
 wrapper; everything of interest is in Gondolin.
 
-### Policy hardening borrowed from Gondolin
+### Gondolin or Firecracker
+
+coop shows what a Firecracker backend looks like, and it is not the
+same trade as Gondolin. Neither is adopted as code: coop cannot boot an
+image it did not build, and Gondolin is a library. The choice is about
+which runtime a jedicave image is handed to.
+
+| Question | Gondolin | Firecracker (coop's shape) |
+|----------|----------|----------------------------|
+| Image input | OCI image as rootfs, Alpine kernel supplied | ext4 rootfs plus kernel we build from the closure |
+| Network path | Host userspace stack, default deny, HTTP/1.x and TLS only | TAP on a host bridge; our iptables allowlist moves to the host `FORWARD` chain, so the guest needs no `NET_ADMIN` |
+| Protocols | No HTTP/2, QUIC, or general UDP | Anything the host rules pass |
+| Workspace | FUSE over virtio-serial, 60 KiB payloads | Block device on the guest disk; copy in, harvest out |
+| Docker in the guest | Untested; the network stack may not carry it | Works; coop runs `dockerd` in every guest |
+| Host privileges | User process plus `/dev/kvm` | `sudo` for TAP, bridge, iptables |
+| macOS | Yes, HVF | No |
+| Secrets | Header substitution per host, built in | Ours to build; coop's jailed proxy with an operation allowlist is the model |
+
+The Gondolin spike stays first because it needs no rootfs work and no
+`sudo`. If its FUSE workspace is too slow for a cargo build, or Docker
+inside the guest turns out to matter, the Firecracker path is next, with
+coop's `network.rs` as the reference for the host side.
+
+### Policy hardening borrowed from Gondolin and coop
 
 Cheap changes to the generated firewall and policy that close gaps the
-comparison surfaced, without changing runtimes. Details under
-"Default-deny egress" in `SECURITY.md`:
+comparisons surfaced, without changing runtimes. Details under
+"Default-deny egress" and "Model API operation allowlist" in
+`SECURITY.md`:
 
 - accept only the proxy IP and DNS when the proxy is on, instead of
   every port on every allowlisted IP;
 - match allowlist rules on port, not just destination IP;
 - block private and link-local ranges plus the cloud metadata address;
 - default `dns.mode` to `synthetic`;
-- default secrets to `inject: proxy`.
+- default secrets to `inject: proxy`;
+- with the proxy on, allow only the model API operations the agent uses
+  and return 403 for everything else on those hosts.

@@ -32,7 +32,8 @@ This document describes what the jedicave isolates, what it does not, and where 
 | Cloud metadata blocking | Prevents IAM credential leaks on cloud hosts |
 | User namespace remapping | Maps container root to unprivileged host UID |
 | Default-deny egress | Drops non-proxy ports on allowlisted IPs, blocks private ranges |
-| gVisor, Kata Containers, or a microVM runtime | Separate kernel from the host; see [RELATED-WORK.md](RELATED-WORK.md) |
+| Model API operation allowlist | Proxy refuses API operations the agent does not need |
+| gVisor, Kata Containers, or a microVM runtime | Separate kernel from the host; Docker for the agent; see [RELATED-WORK.md](RELATED-WORK.md) |
 | Volume integrity checks | Detects tampering between sessions |
 | Audit logging | Supports post-incident analysis |
 
@@ -70,9 +71,13 @@ The firewall is enabled by default, restricting outbound access to allowlisted d
 
 `policy.yaml` supports two injection modes. In `env` mode (the default) the real value is resolved on the host and passed into the shell container's environment, where any process, including code the agent runs, can read it and send it to any allowlisted endpoint. In `proxy` mode the container only sees a placeholder; the real value lives in the proxy sidecar and is substituted into matching headers for the configured domains, so the secret never enters the agent's environment. Proxy mode requires `proxy.enabled: true` and is the mode to prefer for anything beyond the LLM API key.
 
+Proxy mode controls where a secret goes, not what it is used for. Any request to an allowed domain gets the header, including account, admin, or file endpoints the agent never needs. See "Model API operation allowlist" under "Future hardening".
+
 ### Docker socket
 
 The Docker socket is not mounted by default, but if a user adds it, any process inside the container gains full control over the Docker daemon — effectively root on the host.
+
+There is no safe way to give the agent a working `docker` from inside a container. A separate kernel is the only answer: coop runs a full Docker daemon inside each Firecracker guest, where the agent can build and run containers without any path to the host daemon (see [RELATED-WORK.md](RELATED-WORK.md)). This is one of the concrete reasons for the microVM runtime in [ROADMAP.md](ROADMAP.md).
 
 ### Git identity
 
@@ -121,6 +126,18 @@ All software (Claude Code, Oh My Zsh, skills) is baked into the image at build t
 | Network | Untrusted | Outbound by default; inbound blocked by Docker networking |
 
 The **container is the trust boundary**. Everything inside it — workspace files, installed packages, Claude's actions — should be assumed potentially hostile. Everything outside it — host filesystem, Docker daemon, other containers — should remain unaffected.
+
+### Container-to-host channels
+
+Every path by which container-authored bytes reach the host is a taint source. A change that adds one, or widens one, needs the same scrutiny as a change to the firewall. The channels today:
+
+- **`jedi harvest`.** A git bundle is copied out with `docker cp` and fetched into the bare repo under `repos/`. A bundle carries objects and refs only; hooks and config never leave the container. The host user still inspects the staging repo before fetching into a real one.
+- **`jedi diff`.** Output of `git diff` inside the container, printed to the terminal. Text only; it is never fed to a shell on the host.
+- **`jedi cp`.** Arbitrary files copied out with `docker cp`. This is the widest channel. The CLI prompts before writing outside the current directory, and the filenames and contents are attacker-controlled.
+- **Writable mounts.** Anything added with `jedi mount` without `--readonly`, and the workspace bind mount where used, is written by the container directly.
+- **Named volumes.** Not a host channel, but container-authored state that the next container start reads (see "Named volumes" above).
+
+The list follows the taint-source discipline in coop's trust model (see [RELATED-WORK.md](RELATED-WORK.md)).
 
 ### What the container defends against
 
@@ -189,6 +206,10 @@ Tighten the generated firewall so an allowlist entry admits only what the policy
 
 This is the iptables approximation of what Gondolin gets by construction from its userspace network stack (see [RELATED-WORK.md](RELATED-WORK.md)).
 
+### Model API operation allowlist
+
+With the L7 proxy enabled, restrict each allowlisted model host to the operations the agent actually performs and answer everything else with 403 before it leaves the proxy. For `api.anthropic.com` that is `POST /v1/messages` and `POST /v1/messages/count_tokens`. A key that is stolen from the container, or driven by an injected prompt, then cannot reach account, admin, or file endpoints through the cave. Today the `block` hook matches only on body size, so this is a small addition to the generated `proxy-policy.py`. coop's credential proxy ships with exactly this closed list and requires review to widen it (see [RELATED-WORK.md](RELATED-WORK.md)).
+
 ### Cloud metadata blocking
 
 Add an iptables rule to block access to `169.254.169.254` (and its IPv6 equivalent) by default when the firewall is enabled:
@@ -206,6 +227,8 @@ Enable Docker user namespace remapping so that UID 0 inside the container maps t
 Replace the default runc runtime with [gVisor](https://gvisor.dev/) (application kernel) or [Kata Containers](https://katacontainers.io/) (lightweight VMs). These provide a stronger isolation boundary than Linux namespaces alone by intercepting syscalls before they reach the host kernel. Both are pluggable Docker runtimes, so they are a `runtime:` line in `compose.yml` and do not touch the image build.
 
 A third option is [Gondolin](https://github.com/earendil-works/gondolin), the QEMU microVM library behind `vmpi`. It gives a hardware boundary like Kata, but also replaces the guest's network path with a host-side userspace stack that classifies every flow (HTTP parsed, TLS intercepted, unknown TCP and all non-DNS UDP dropped) and substitutes secrets only into requests bound for their allowed hosts. Its image builder can take an OCI image as the rootfs, so a Nix- or Guix-built jedicave could run under it unchanged. It is not a Docker runtime, so it would replace the compose layer rather than plug into it. Trade-offs and a spike plan are in [RELATED-WORK.md](RELATED-WORK.md) and [ROADMAP.md](ROADMAP.md).
+
+A fourth option is [Firecracker](https://firecracker-microvm.github.io/) directly, the path Trail of Bits' [coop](https://github.com/trailofbits/coop) takes. The guest gets a full kernel and a TAP device on a host bridge, so the egress allowlist moves from inside the container to the host's `FORWARD` chain, `NET_ADMIN` leaves the guest, the workspace lives on a block device at native speed, and a Docker daemon can run inside the guest. The costs are `sudo` on the host for TAP, bridge, and iptables setup, no macOS, and an ext4 rootfs plus kernel that we would have to build from the Nix or Guix closure ourselves, since coop only boots its own Ubuntu image. How this weighs against Gondolin is in [ROADMAP.md](ROADMAP.md).
 
 ### Volume integrity
 
