@@ -141,7 +141,9 @@ jedi seed /home/yoda/code/foo dagobah
 
 This creates a **bare repo** in the cave at `repos/foo.git`, pushes your
 current branch into it, and mounts it into the container. On startup the
-container clones it into `/workspace/foo`.
+container clones it into `/workspace/foo`. Only the branch is pushed; add
+`--tags` when the project's build derives a version from `git describe`,
+which needs a reachable tag. `jedi reseed --tags` does the same later.
 
 Why a bare repo instead of a direct bind mount? See
 [Git Handoff Lifecycle](#git-handoff-lifecycle) below.

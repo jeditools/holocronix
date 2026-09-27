@@ -2192,6 +2192,31 @@ def firewall(
                         "/usr/local/sbin/iptables", "-L", "-n", "-v"], cwd=d, env=cenv)
 
 
+def _push_tags(repo: Path, bare: Path, branch: str | None, force: bool) -> None:
+    """Push the tags reachable from BRANCH (or every tag when BRANCH is None,
+    the --all case) from REPO into the bare repo.  Behind `--tags` on seed
+    and reseed.
+
+    A branch push carries no tags, and a clone of the bare repo then has
+    none either, so `git describe` fails inside the cave and build tooling
+    that derives a version from it (xous-core's image signer, for one)
+    fails with it.  Only reachable tags are pushed: `git describe` cannot
+    use any other, and unreachable ones would drag unrelated history into
+    the cave."""
+    if branch is None:
+        tags = subprocess.run(["git", "tag"], cwd=repo,
+                              capture_output=True, text=True).stdout.split()
+    else:
+        tags = subprocess.run(["git", "tag", "--merged", branch], cwd=repo,
+                              capture_output=True, text=True).stdout.split()
+    if not tags:
+        return
+    push_cmd = ["git", "push"] + (["--force"] if force else [])
+    run(push_cmd + [str(bare)] + [f"refs/tags/{t}:refs/tags/{t}" for t in tags],
+        cwd=repo)
+    console.print(f"[dim]  {len(tags)} tag(s) pushed[/]")
+
+
 @app.command()
 def seed(
     repo_path: Annotated[str, typer.Argument(help="Path to source git repo")],
@@ -2200,6 +2225,7 @@ def seed(
     all_branches: Annotated[bool, typer.Option("--all", help="Seed all branches")] = False,
     force: Annotated[bool, typer.Option("--force", "-f", help="Force-push (overwrite diverged branches)")] = False,
     depth: Annotated[Optional[int], typer.Option(help="Shallow clone with N commits of history")] = None,
+    tags: Annotated[bool, typer.Option("--tags", help="Also push the tags reachable from the seeded branch(es), for git describe")] = False,
 ):
     """Seed a repo into the cave as a bare repo for secure git handoff."""
     name, d = resolve_cave(name)
@@ -2265,7 +2291,11 @@ def seed(
             bare_path.rename(trash_dest)
             console.print(f"[dim]  Moved existing bare repo to {trash_dest}[/]")
 
+        # A clone follows tags into the fetched history by default; keep tags
+        # opt-in here as in the full seed below.
         clone_cmd = ["git", "clone", "--bare", f"--depth={depth}"]
+        if not tags:
+            clone_cmd.append("--no-tags")
         if all_branches:
             clone_cmd.append("--no-single-branch")
         else:
@@ -2294,7 +2324,7 @@ def seed(
         run(["git", "--git-dir", str(bare_path), "config",
              "jedicave.sourceRepo", str(repo)], check=False)
 
-        # Push branches
+        # Push branches, then with --tags the tags reachable from them
         push_cmd = ["git", "push"] + (["--force"] if force else [])
         try:
             if all_branches:
@@ -2314,6 +2344,8 @@ def seed(
                 # Set HEAD to the seeded branch
                 run(["git", "--git-dir", str(bare_path),
                      "symbolic-ref", "HEAD", f"refs/heads/{branch}"])
+            if tags:
+                _push_tags(repo, bare_path, None if all_branches else branch, force)
         except subprocess.CalledProcessError:
             err_console.print(
                 "[red]Push rejected — the bare repo has diverged (e.g. from harvested agent commits).[/]\n"
@@ -2351,6 +2383,7 @@ def reseed(
     name: Annotated[Optional[str], typer.Option("--cave", "-c", help="Cave name", autocompletion=complete_cave_name)] = None,
     all_branches: Annotated[bool, typer.Option("--all", help="Push all branches")] = False,
     force: Annotated[bool, typer.Option("--force", "-f", help="Force-push (overwrite diverged branches)")] = False,
+    tags: Annotated[bool, typer.Option("--tags", help="Also push the tags reachable from the pushed branch(es), for git describe")] = False,
 ):
     """Re-push host repo commits into seeded bare repos.
 
@@ -2410,6 +2443,8 @@ def reseed(
                          cwd=Path(source_repo), check=False)
 
         if result.returncode == 0:
+            if tags:
+                _push_tags(Path(source_repo), bare, None if all_branches else branch, force)
             # Update seeded count
             count_result = subprocess.run(
                 ["git", "--git-dir", str(bare), "rev-list", "--all", "--count"],
